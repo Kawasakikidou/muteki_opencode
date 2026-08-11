@@ -1499,6 +1499,55 @@ async def test_swarm_driver_online_keeps_kb(tmp_path, monkeypatch):
     assert captured["kb"] is True  # online default keeps KB
 
 
+async def test_swarm_driver_fast_mode_single_worker_short_budget(tmp_path, monkeypatch):
+    # 快解模式(fast):一键降级为单引擎 + 单 worker + 短墙钟预算 + 无协调器,
+    # 适合简单题秒解/批量扫题。显式传入的参数必须优先于 fast 的兜底。
+    from apps.web import drivers
+    import muteki.swarm.swarm as sw
+
+    captured = {}
+
+    class FakeSwarm:
+        def __init__(self, challenge, lineup, **kw):
+            captured.update(kw)
+        async def run(self):
+            class O:
+                flag = None
+                solved = False
+            return O()
+
+    monkeypatch.setattr(sw, "Swarm", FakeSwarm)
+
+    class FakeBus:
+        async def emit(self, *a, **k): pass
+        async def close(self): pass
+        def add_sink(self, *a): pass
+
+    class FakeRun:
+        run_id = "r-fast"; bus = FakeBus(); hitl = None; worker_cmds = None
+        cost = None; flag = None
+
+    # fast=true 且未显式给参数 → 全部走 fast 默认
+    driver = drivers._swarm_driver(drivers._infer_challenge(
+        {"kind": "swarm", "fast": True,
+         "challenge": {"description": "solve me"}}))
+    await driver(FakeRun())
+    assert captured["start_workers"] == 1
+    assert captured["max_workers"] == 1
+    assert captured["coordinator"] is False
+    assert captured["wall_clock_budget"] == 300.0
+
+    # 显式参数优先:fast=true 但显式 max_workers=3 / coordinator=true
+    captured.clear()
+    driver = drivers._swarm_driver(drivers._infer_challenge(
+        {"kind": "swarm", "fast": True, "max_workers": 3, "coordinator": True,
+         "challenge": {"description": "solve me"}}))
+    await driver(FakeRun())
+    assert captured["max_workers"] == 3
+    assert captured["coordinator"] is True
+    assert captured["wall_clock_budget"] == 300.0  # 未显式给 → 仍走 fast 默认
+
+
 async def test_swarm_driver_threads_stage_policy_budgets_and_llm_profiles(tmp_path, monkeypatch):
     from apps.web import drivers
     import muteki.swarm.swarm as sw

@@ -446,7 +446,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 if profile is not None:
                     return profile, cand
                 base = base_engine_for_profile(cand)
-                if base in ("claude", "codex", "cursor"):
+                if base in ("claude", "codex", "cursor", "opencode"):
                     return None, base
             return None, "claude"
 
@@ -887,7 +887,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         from muteki.solver.credential_accounts import detect_system_login
 
         logins = await asyncio.to_thread(
-            lambda: {e: detect_system_login(e) for e in ("claude", "codex", "cursor")}
+            lambda: {e: detect_system_login(e) for e in ("claude", "codex", "cursor", "opencode")}
         )
         return {"logins": logins}
 

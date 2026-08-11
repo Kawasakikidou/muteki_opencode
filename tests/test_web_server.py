@@ -477,7 +477,7 @@ async def test_settings_redesign_endpoints(tmp_path) -> None:
             sl = await client.get("/api/settings/system-login")
             assert sl.status_code == 200
             logins = sl.json()["logins"]
-            assert set(logins) == {"claude", "codex", "cursor"}
+            assert set(logins) == {"claude", "codex", "cursor", "opencode"}
             assert all(v in ("present", "absent", "unknown") for v in logins.values())
 
             # runtime-environment: flip to local, all profiles follow

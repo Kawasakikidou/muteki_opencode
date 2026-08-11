@@ -9,7 +9,9 @@ from __future__ import annotations
 from typing import Any
 
 
-VALID_BASE_ENGINES = ("claude", "codex", "cursor")
+# worker profile 可指向的基础引擎。opencode 作为第 4 引擎加入
+# (muteki-for-ctf):其 CLI 通过 `opencode run --format json` 外部驱动。
+VALID_BASE_ENGINES = ("claude", "codex", "cursor", "opencode")
 TRANSPORT_TO_ENGINE = {
     "claude": "claude",
     "claude_code": "claude",
@@ -17,6 +19,8 @@ TRANSPORT_TO_ENGINE = {
     "codex_cli": "codex",
     "cursor": "cursor",
     "cursor_agent": "cursor",
+    "opencode": "opencode",
+    "opencode_cli": "opencode",
 }
 DEFAULT_ROLES = ["race", "bootstrap", "explore", "respond", "review"]
 

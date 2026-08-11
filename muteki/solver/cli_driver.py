@@ -58,6 +58,7 @@ _ENV_OVERRIDE = {
     "claude": "MUTEKI_CLAUDE_BIN",
     "codex": "MUTEKI_CODEX_BIN",
     "cursor": "MUTEKI_CURSOR_BIN",
+    "opencode": "MUTEKI_OPENCODE_BIN",
 }
 
 # The on-disk binary basename for an engine, when it differs from the engine
@@ -84,6 +85,12 @@ _KNOWN_GOOD = {
         "~/.local/bin/cursor-agent",
         "/opt/homebrew/bin/cursor-agent",
         "/usr/local/bin/cursor-agent",
+    ],
+    "opencode": [
+        # opencode 官方 installer 装到 ~/.opencode/bin;以下均为常见 PATH 位置
+        "~/.local/bin/opencode",
+        "/opt/homebrew/bin/opencode",
+        "/usr/local/bin/opencode",
     ],
 }
 
@@ -943,10 +950,157 @@ class CursorDriver(CliDriver):
         return r.returncode == 0 and '"result"' in (r.stdout or "")
 
 
+class OpencodeDriver(CliDriver):
+    """`opencode run` — opencode CLI 的无头 JSON 事件模式驱动。
+
+    会话 ID(`ses_...`)由引擎分配(从任意流事件中抓取);续会话用 `-s <id>`。
+    `--auto` 提供完整 shell 权限(自动批准所有权限请求)——等价于 claude 的
+    --dangerously-skip-permissions / codex 的 --dangerously-bypass-approvals-and-sandbox。
+    输出格式:--format json(每步一个 NDJSON 事件)。
+
+    离线评估:opencode 没有 CLI 级工具禁用参数,所以 web_access=False 由
+    cli_solver._apply_runtime_argv 注入内联 OPENCODE_CONFIG_CONTENT
+    ({"tools":{"webfetch":false,"websearch":false}}) 实现 —— 与 cursor 的
+    --endpoint 注入是同一模式(env 而非 argv)。
+
+    计费:opencode 在流中报告每步美元成本(step_finish → part.cost),
+    记账精确,无需价格表回退。
+    """
+    name = "opencode"
+
+    def _argv(self, prompt: str, session: Optional[str]) -> list[str]:
+        args = [self.bin, "run", "--format", "json", "--auto"]
+        if session:
+            args += ["-s", session]
+        return [*args, "--title", "muteki-worker", prompt]
+
+    def build_execute(
+        self, prompt: str, session: Optional[str], *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+    ) -> list[str]:
+        return self._argv(prompt, session)
+
+    def build_resume(
+        self, prompt: str, session: str, *,
+        web_access: bool = True, kb_access: bool = True, stream: bool = False,
+    ) -> list[str]:
+        return self._argv(prompt, session)
+
+    def parse_stream_steps(self, line: str) -> list[StreamStep]:
+        # opencode --format json 每步输出一个 NDJSON 事件:
+        #   {"type":"step_start","sessionID":"ses_...",...}
+        #   {"type":"text","part":{"type":"text","text":"..."}}
+        #   {"type":"tool_use","part":{"type":"tool","tool":"bash","callID":...,
+        #     "state":{"status":"completed","input":{...},"output":"<完整 stdout>"}}}
+        #   {"type":"step_finish","part":{"type":"step-finish","reason":"stop",
+        #     "tokens":{...},"cost":0.0005}}
+        # tool_use 事件同时携带调用与结果 → 生成两个步骤。
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            return []
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            return []
+        t = ev.get("type")
+        session = str(ev.get("sessionID") or "")
+        if t == "step_start":
+            return [StreamStep("session", session=session)] if session else []
+        part = ev.get("part") or {}
+        if not isinstance(part, dict):
+            return []
+        steps: list[StreamStep] = []
+        if t == "text":
+            txt = str(part.get("text") or "").strip()
+            if txt:
+                steps.append(StreamStep("reasoning", text=txt))
+        elif t == "tool_use":
+            tool = str(part.get("tool") or "")
+            state = part.get("state") or {}
+            if not isinstance(state, dict):
+                state = {}
+            inp = state.get("input")
+            preview = ""
+            if isinstance(inp, dict):
+                preview = str(inp.get("command") or inp.get("filePath")
+                               or inp.get("pattern") or "")
+            steps.append(StreamStep("tool", tool=tool, text=preview[:300]))
+            out = state.get("output")
+            if isinstance(out, str) and out.strip():
+                # text 截断给面板;raw 保留全文给溯源门禁。
+                steps.append(StreamStep("tool_result", text=out[:600], raw=out))
+            elif isinstance(out, dict) and out:
+                s = json.dumps(out, ensure_ascii=False)
+                steps.append(StreamStep("tool_result", text=s[:600], raw=s))
+        return steps
+
+    def parse(self, stdout: str, stderr: str) -> CliResult:
+        text, cost, turns, session = "", 0.0, 0, None
+        in_tok = out_tok = 0
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                text += line + "\n"      # 容忍非 JSON 行
+                continue
+            sid = ev.get("sessionID")
+            if sid:
+                session = sid
+            part = ev.get("part") or {}
+            if not isinstance(part, dict):
+                continue
+            t = ev.get("type")
+            if t == "text":
+                text += str(part.get("text") or "") + "\n"
+            elif t == "step_finish":
+                turns += 1
+                c = part.get("cost")
+                if isinstance(c, (int, float)):
+                    cost += float(c)
+                tk = part.get("tokens") or {}
+                if isinstance(tk, dict):
+                    cache = tk.get("cache") or {}
+                    if not isinstance(cache, dict):
+                        cache = {}
+                    in_tok += int(tk.get("input") or 0) + int(cache.get("read") or 0)
+                    out_tok += int(tk.get("output") or 0) + int(tk.get("reasoning") or 0)
+        if not text.strip() and not stdout.strip() and stderr.strip():
+            tail = "\n".join(stderr.strip().splitlines()[-12:])[-1800:]
+            text = f"[opencode stderr]\n{tail}\n"
+        return CliResult(text=text[-8000:] or stdout[-8000:], session=session,
+                         cost_usd=(cost or None), num_turns=turns or None,
+                         input_tokens=(in_tok or None), output_tokens=(out_tok or None),
+                         raw_stderr=stderr[-2000:])
+
+    def _hello_argv(self) -> list[str]:
+        # 真实单轮请求(不带 --auto:hello 不需要工具)——与 claude/codex 对称,
+        # 让自检真正打通 opencode 的认证链路。
+        return [self.bin, "run", self.HELLO_PROMPT, "--format", "json"]
+
+    def _hello_ok(self, r: "subprocess.CompletedProcess") -> bool:
+        # 完成一轮模型回复即证明认证/配额与后端往返可用:流中至少出现过
+        # 一条带内容的 {"type":"text"} 事件。
+        for line in (r.stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "text" and (ev.get("part") or {}).get("text"):
+                return True
+        return False
+
+
 DRIVERS: dict[str, CliDriver] = {
     "claude": ClaudeCodeDriver(),
     "codex": CodexDriver(),
     "cursor": CursorDriver(),
+    "opencode": OpencodeDriver(),
 }
 
 

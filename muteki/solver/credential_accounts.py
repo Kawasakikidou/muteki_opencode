@@ -183,8 +183,8 @@ class CredentialAccountStore:
         engine = engine.strip().lower()
         if not valid_account_id(account_id):
             raise ValueError("account_id must be 1-64 chars: letters, digits, _, ., -")
-        if engine not in {"claude", "codex", "cursor", "api"}:
-            raise ValueError("engine must be claude, codex, cursor, or api")
+        if engine not in {"claude", "codex", "cursor", "opencode", "api"}:
+            raise ValueError("engine must be claude, codex, cursor, opencode, or api")
 
         # EDIT support: secrets are never read back to the UI, so an operator who
         # only wants to change an endpoint's base_url / target_engine cannot
@@ -214,8 +214,8 @@ class CredentialAccountStore:
             # explicit clear isn't expressible here, and isn't needed by the panel.
             b = str(base_url or "").strip() or prior.get("BASE_URL", "")
             te = str(target_engine or "").strip().lower() or prior.get("ENGINE", "")
-            if te and te not in {"claude", "codex", "cursor"}:
-                raise ValueError("target_engine must be claude, codex, or cursor")
+            if te and te not in {"claude", "codex", "cursor", "opencode"}:
+                raise ValueError("target_engine must be claude, codex, cursor, or opencode")
             base = self._replace_account(account_id)
             self._atomic_write(base / "API_KEY", value + "\n")
             if b:
@@ -306,7 +306,7 @@ class CredentialAccountStore:
             marker = mp.read_text(encoding="utf-8").strip().lower()
         except OSError:
             return ""
-        return marker if marker in {"claude", "codex", "cursor"} else ""
+        return marker if marker in {"claude", "codex", "cursor", "opencode"} else ""
 
     @staticmethod
     def _read_base_url(base: Path) -> str:
@@ -524,6 +524,30 @@ def runtime_env_for_engine(
                 container_path=_container_secret_path(account_id, "CURSOR_API_KEY"),
                 source=source,
             )
+    elif e == "opencode":
+        # opencode 按 provider 认证:读 ~/.local/share/opencode/auth.json
+        # ({provider: {type, key}}),base_url 在每个 provider 的配置里。
+        # 宿主模式直接继承宿主登录;账户也可以钉一个 API_KEY+BASE_URL
+        # (单 provider 覆盖)或完整的 opencode-data/auth.json(多 provider)。
+        if base is not None and (base / "API_KEY").exists():
+            _add_secret_file_or_env(
+                out,
+                base=base,
+                filename="API_KEY",
+                env_name="OPENCODE_API_KEY",
+                container=container,
+                container_path=_container_secret_path(account_id, "API_KEY"),
+                source=source,
+            )
+            _add_base_url(out, base=base, env_name="OPENCODE_BASE_URL")
+        opencode_data = base / "opencode-data" if base is not None else None
+        if opencode_data is not None and (opencode_data / "auth.json").exists():
+            # XDG_DATA_HOME 把 opencode 的整个数据目录(auth.json + 会话)
+            # 重定向到投影后的账户目录 —— 可读且可写。
+            out["XDG_DATA_HOME"] = (
+                f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}/opencode-data"
+                if container else str(opencode_data.resolve())
+            )
 
     return RuntimeCredentialEnv(account_id=account_id, env=out)
 
@@ -625,8 +649,9 @@ def detect_system_login(engine: str, env: Mapping[str, str] | None = None) -> st
 
 
 # Filenames whose containing dir must be WRITABLE inside the container so the CLI
-# can refresh state in place (codex ChatGPT-auth refreshes CODEX_HOME/auth.json).
-_WRITABLE_STATE_DIRS = ("codex-home",)
+# can refresh state in place (codex ChatGPT-auth refreshes CODEX_HOME/auth.json;
+# opencode writes session/state under XDG_DATA_HOME).
+_WRITABLE_STATE_DIRS = ("codex-home", "opencode-data")
 
 
 def project_account_root(src_root: str | Path, dest_root: str | Path) -> Path:

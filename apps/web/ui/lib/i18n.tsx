@@ -497,6 +497,7 @@ const STRINGS: Dict = {
   "settings.typeClaudeToken": { zh: "claude · 订阅 token", en: "claude · subscription token" },
   "settings.typeCodexAuth": { zh: "codex · auth.json", en: "codex · auth.json" },
   "settings.typeCursorKey": { zh: "cursor · API key", en: "cursor · API key" },
+  "settings.typeOpencodeAuth": { zh: "opencode · auth.json", en: "opencode · auth.json" },
   "settings.typeCustomEndpoint": { zh: "自定义端点 · base_url + key", en: "custom endpoint · base_url + key" },
   "settings.accountTargetEngine": { zh: "归属 agent", en: "For agent" },
   "settings.accountTargetEngineHint": { zh: "自定义端点要覆盖哪个 agent。账号 ID 会自动对齐成该 agent 默认引用的 {id}。", en: "Which agent this endpoint overrides. The account ID auto-aligns to that agent's default reference {id}." },

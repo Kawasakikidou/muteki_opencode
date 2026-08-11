@@ -15,6 +15,7 @@ const ENGINE_COLOR: Record<string, string> = {
   claude: "#0891b2", // --cyan
   codex: "#db2777", // --pink
   cursor: "#7c3aed", // --violet
+  opencode: "#16a34a", // --green
   reason: "#b45309", // --amber (coordinator)
   deepseek: "#b45309",
   verifier: "#ca8a04", // --gold (deeper than --gold body token for chip contrast)
@@ -26,9 +27,11 @@ export function workerEngine(id: string, engine?: string): string {
   if (s === "claude_code" || s === "claude") return "Claude Code";
   if (s === "codex_cli" || s === "codex") return "Codex";
   if (s === "cursor_agent" || s === "cursor") return "Cursor";
+  if (s === "opencode" || s === "opencode_cli") return "Opencode";
   if (s.includes("codex")) return "Codex";
   if (s.includes("cursor")) return "Cursor";
   if (s.includes("claude")) return "Claude Code";
+  if (s.includes("opencode")) return "Opencode";
   if (s.includes("deepseek") || s === "reason") return "DeepSeek";
   if (s.includes("mock")) return "Mock";
   if (s.includes("verifier")) return "Verifier";
@@ -68,5 +71,6 @@ export function resumeCommand(engine: string, session: string): string {
   const resolved = workerEngine(engine, engine);
   if (resolved === "Codex") return `codex exec resume ${session}`;
   if (resolved === "Cursor") return `cursor-agent --resume ${session}`;
+  if (resolved === "Opencode") return `opencode run -s ${session}`;
   return `claude -r ${session}`;
 }

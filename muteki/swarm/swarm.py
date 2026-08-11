@@ -66,6 +66,8 @@ _BLACKBOARD_SKILL_LINKS = (
     ".codex/skills/muteki-blackboard",
     ".cursor/skills-cursor/muteki-blackboard",
     ".cursor/skills/muteki-blackboard",
+    # opencode 从全局配置目录读取 skill(~/.config/opencode/skills)。
+    ".config/opencode/skills/muteki-blackboard",
 )
 
 

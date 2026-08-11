@@ -16,7 +16,8 @@ from muteki.core.events import EventType
 from muteki.models.solve_graph import Challenge
 from muteki.solver import cli_solver
 from muteki.solver.cli_driver import (
-    ClaudeCodeDriver, CodexDriver, CursorDriver, DRIVERS, driver_for, get_driver,
+    ClaudeCodeDriver, CodexDriver, CursorDriver, OpencodeDriver, DRIVERS, driver_for,
+    get_driver, StreamStep,
     _descendant_pids, _kill_proc_tree, _probe_health_with_creds,
 )
 from muteki.solver.cli_solver import CliSolver
@@ -215,6 +216,84 @@ def test_cursor_execute_non_stream_uses_json():
     d = CursorDriver()
     argv = d.build_execute("GO", None, stream=False)
     assert argv[argv.index("--output-format") + 1] == "json"
+
+
+# ── opencode driver(第 4 引擎)────────────────────────────────────────────
+
+def test_opencode_execute_and_resume():
+    d = OpencodeDriver()
+    assert d.new_session() is None  # opencode 会话 ID 由引擎自己分配
+    ex = d.build_execute("DO THE THING", None)
+    assert ex[0] == d.bin and ex[1] == "run"
+    assert "--format" in ex and "json" in ex
+    assert "--auto" in ex                       # 无头全 shell 审批
+    assert ex[-1] == "DO THE THING"             # prompt 是尾部位置参数
+    rs = d.build_resume("CONCLUDE", "ses_abc123", web_access=False)
+    assert rs[1] == "run" and "-s" in rs
+    assert rs[rs.index("-s") + 1] == "ses_abc123"
+
+
+def test_opencode_hello():
+    d = OpencodeDriver()
+    argv = d._hello_argv()
+    assert argv[1] == "run" and "--format" in argv
+    # hello 探针不能带 --auto(它不需要工具)——只验证认证。
+    assert "--auto" not in argv
+    ok = d._hello_ok(subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout='{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}\n'
+               '{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"OK"}}\n',
+        stderr=""))
+    assert ok is True
+    bad = d._hello_ok(subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout='{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}\n',
+        stderr=""))
+    assert bad is False
+
+
+def test_opencode_parse_real_stream():
+    # 真实 opencode --format json 流(1.18.x 实测):text 事件携带助手输出,
+    # step_finish 携带成本 + token 桶。
+    d = OpencodeDriver()
+    out = "\n".join([
+        '{"type":"step_start","sessionID":"ses_0150abc","part":{"type":"step-start"}}',
+        '{"type":"text","sessionID":"ses_0150abc","part":{"type":"text","text":"OK","time":{"start":1,"end":2}}}',
+        '{"type":"step_finish","sessionID":"ses_0150abc","part":{"type":"step-finish","reason":"stop",'
+        '"tokens":{"total":7701,"input":5889,"output":3,"reasoning":17,"cache":{"write":0,"read":1792}},'
+        '"cost":0.0004175388}}',
+    ])
+    r = d.parse(out, "")
+    assert r.session == "ses_0150abc"
+    assert "OK" in r.text
+    assert r.num_turns == 1
+    assert r.cost_usd == pytest.approx(0.0004175388)
+    assert r.input_tokens == 5889 + 1792   # fresh + cache.read
+    assert r.output_tokens == 3 + 17       # output + reasoning
+
+
+def test_opencode_stream_steps_tool_events():
+    # tool_use 事件同时携带调用与结果 → 两个步骤;raw 保留完整输出
+    # (溯源门禁必须看到未截断的真实输出)。
+    d = OpencodeDriver()
+    line = '{"type":"tool_use","sessionID":"ses_1","part":{"type":"tool","tool":"bash",' \
+           '"callID":"call_0","state":{"status":"completed","input":{"command":"cat flag.txt"},' \
+           '"output":"flag{opencode_found}\\r\\n","metadata":{}},"id":"prt_1"}}'
+    steps = d.parse_stream_steps(line)
+    assert [s.kind for s in steps] == ["tool", "tool_result"]
+    assert steps[0].tool == "bash"
+    assert "cat flag.txt" in steps[0].text
+    assert steps[1].text == "flag{opencode_found}\r\n"[:600]
+    assert steps[1].raw == "flag{opencode_found}\r\n"  # 给门禁的未截断原文
+
+
+def test_opencode_stream_step_session():
+    d = OpencodeDriver()
+    steps = d.parse_stream_steps(
+        '{"type":"step_start","sessionID":"ses_42","part":{"type":"step-start"}}')
+    assert steps == [StreamStep("session", session="ses_42")]
+    # 非 JSON / 噪音行被忽略
+    assert d.parse_stream_steps("not json at all") == []
 
 
 def test_cursor_resume_uses_resume_flag():
@@ -606,9 +685,10 @@ def test_claude_offline_and_kb_off_share_one_deny_flag():
 
 
 def test_registry():
-    assert set(DRIVERS) == {"claude", "codex", "cursor"}
+    assert set(DRIVERS) == {"claude", "codex", "cursor", "opencode"}
     assert get_driver("claude").name == "claude"
     assert get_driver("cursor").name == "cursor"
+    assert get_driver("opencode").name == "opencode"
 
 
 def test_kill_proc_tree_kills_setsid_escaped_orphan_and_reaps():

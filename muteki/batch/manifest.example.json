@@ -1,0 +1,22 @@
+{
+  "_comment": "muteki CTF 比赛模式 manifest 示例。字段说明见 muteki/batch/README.md",
+  "engines": ["opencode"],
+  "timeout": 300,
+  "backend": "local",
+  "challenges": [
+    {
+      "id": "misc-hello",
+      "name": "Hello Flag",
+      "category": "misc",
+      "description": "Read /tmp/batch_demo_flag.txt and report the flag.",
+      "attachments": []
+    },
+    {
+      "id": "crypto-demo",
+      "name": "Crypto Demo",
+      "category": "crypto",
+      "description": "Decode the base64 string in /tmp/batch_demo_b64.txt and report the inner flag.",
+      "attachments": []
+    }
+  ]
+}

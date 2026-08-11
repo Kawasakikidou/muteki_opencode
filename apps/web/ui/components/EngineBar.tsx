@@ -7,6 +7,7 @@ const LABELS: Record<string, string> = {
   cursor: "Cursor",
   claude: "Claude",
   codex: "Codex",
+  opencode: "Opencode",
 };
 
 /** Why an engine is degraded, or "" when it's fine. Two independent signals:

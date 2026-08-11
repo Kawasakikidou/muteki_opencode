@@ -78,6 +78,9 @@ _CONTAINER_BIN = {
     "claude": "claude",
     "codex": "codex",
     "cursor": "/home/kali/.local/bin/cursor-agent",
+    # opencode 必须预装在 worker 镜像中(例如官方 installer 装到
+    # ~/.opencode/bin、npm 全局安装,或直接放到 PATH 上)。
+    "opencode": "opencode",
 }
 
 

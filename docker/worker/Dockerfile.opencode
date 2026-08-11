@@ -1,0 +1,31 @@
+# 增量镜像:在官方 worker 镜像上叠加 opencode 引擎(muteki-for-ctf)。
+# 基于官方镜像加层,避免重复构建 Kali+Ghidra+Sage 全量层(数小时)。
+# 功能等价于 docker/worker/Dockerfile 第 5/8 步的 opencode 部分。
+#
+# 构建(上下文 = docker/worker/,需先同步 skill 文件,见 build-opencode.sh):
+#   docker build --platform linux/amd64 --load -f Dockerfile.opencode -t muteki-worker-opencode:latest .
+FROM ghcr.io/fishcodetech/muteki-worker:latest
+
+# 1) opencode 引擎:与官方 claude/codex 相同路径(/usr/local/bin,npm 全局)。
+#    版本与宿主 WSL 开发环境保持一致;认证运行时注入,不烘焙任何 key。
+RUN npm install -g opencode-ai@1.18.16
+
+# 2) 黑板 skill 装到 opencode 的全局 skill 目录(~/.config/opencode/skills),
+#    与 swarm._BLACKBOARD_SKILL_LINKS / cli_solver.skill_root 的约定一致。
+USER kali
+RUN mkdir -p /home/kali/.config/opencode/skills/muteki-blackboard
+USER root
+COPY ./blackboard.SKILL.md /home/kali/.config/opencode/skills/muteki-blackboard/SKILL.md
+COPY ./blackboard.py /home/kali/.config/opencode/skills/muteki-blackboard/blackboard.py
+
+# 3) VulnClaw CTF 知识 skill(ctf-kb,crypto/misc/web/reverse)——来自
+#    VulnClaw 项目(vulnclaw/skills/specialized 的 CTF 四件套,工具名已
+#    通用化,不依赖 VulnClaw 特有工具)。装进 opencode 全局 skills,
+#    worker 遇到对应题型时按 SKILL.md 的 frontmatter 自动加载。
+COPY ./ctf-kb/ /home/kali/.config/opencode/skills/
+RUN chown -R kali:kali /home/kali/.config && \
+    find /home/kali/.config/opencode/skills -name "*.py" -exec chmod +x {} +
+
+LABEL org.opencontainers.image.title="muteki-worker-opencode" \
+      org.opencontainers.image.description="muteki worker + opencode engine (增量层,基于官方镜像)" \
+      org.opencontainers.image.version="ctf-0.1"

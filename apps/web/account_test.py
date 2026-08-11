@@ -36,6 +36,7 @@ _CONTAINER_BIN = {
     "claude": "claude",
     "codex": "codex",
     "cursor": "/home/kali/.local/bin/cursor-agent",
+    "opencode": "opencode",
 }
 
 

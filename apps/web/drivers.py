@@ -322,14 +322,15 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         kb = bool(body.get("kb", not offline))
         n = int(body.get("n_solvers", 2))
         coordinator = bool(body.get("coordinator", True))
-        # engine roster: three-engine race by default (cursor + claude + codex).
-        # Resolution order: explicit body.engines > the operator's per-category
-        # worker-config default (apps/web/worker_config.py) > the hardcoded roster.
-        # OFFLINE drops cursor — Cursor's headless CLI has no --disallowed-tools to
-        # deny web tools and doesn't inherit the optional KB MCP, so it can't run a
-        # clean offline bench eval (protects the AGENTS.md offline rule).
+        # 默认引擎阵容:四引擎竞速(cursor + claude + codex + opencode)。
+        # 解析顺序:显式 body.engines > 操作员按类别配置的 worker-config 默认值
+        # (apps/web/worker_config.py) > 硬编码阵容。
+        # OFFLINE 模式剔除 cursor —— Cursor 的无头 CLI 没有 --disallowed-tools
+        # 禁 web 工具,也不继承可选 KB MCP,无法跑干净的离线基准评估
+        # (保护 AGENTS.md 的离线规则)。opencode 可以离线(通过
+        # OPENCODE_CONFIG_CONTENT 禁用 webfetch/websearch),所以不剔除。
         wc = mgr.worker_config.resolve(challenge.category) if mgr is not None else {}
-        engines = body.get("engines") or wc.get("engines") or ["cursor", "claude", "codex"]
+        engines = body.get("engines") or wc.get("engines") or ["cursor", "claude", "codex", "opencode"]
         runtime_profiles = body.get("runtime_profiles") or wc.get("runtime_profiles") or []
         worker_profiles = body.get("worker_profiles") or wc.get("worker_profiles") or []
         # OFFLINE normally drops cursor (no --disallowed-tools to deny web tools →
@@ -464,6 +465,23 @@ def _swarm_driver(body: dict[str, Any], mgr: RunManager | None = None) -> Driver
         # sessions/{id}/workspace/ and survives sandbox.shutdown_all()'s rmtree of
         # sbx. It's cleaned up with the run (RunManager.delete drops sessions/{id}).
         worker_root = root / "workers"
+
+        # ── 快解模式(fast)────────────────────────────────────────────────
+        # 语义化开关:一键把 run 配成"单引擎低成本快速试解"——单 worker、
+        # race-scout 单轮、5 分钟墙钟上限、不拉起协调器。适合简单题秒解 /
+        # 批量扫题,避免整套 swarm 烧 token。显式传入的参数优先,fast 只
+        # 兜底未显式给出的项。
+        if body.get("fast"):
+            if "engines" not in body and not wc.get("engines"):
+                engines = engines[:1]               # 只留健康列表第一个引擎
+            if "start_workers" not in body:
+                start_workers = 1
+            if "max_workers" not in body:
+                max_workers = 1
+            if "wall_clock_budget" not in body and not (wc and wc.get("wall_clock_budget")):
+                wall_clock_budget = 300.0           # 5 分钟墙钟上限
+            if "coordinator" not in body:
+                coordinator = False                 # 不启动 Reason 协调器
 
         # LLMClient: the coordinator needs it for the Reason planner. A plain CLI
         # race needs none.

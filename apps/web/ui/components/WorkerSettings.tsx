@@ -53,13 +53,13 @@ import { Icon, IconName } from "@/components/Icon";
  */
 
 type WorkerProfile = WS["worker_profiles"][number];
-type AccountType = "claude" | "codex" | "cursor" | "api";
+type AccountType = "claude" | "codex" | "cursor" | "opencode" | "api";
 type Backend = "local" | "container";
 type NetworkMode = "bridge" | "host" | "none";
 type Tab = "roster" | "accounts" | "runtime" | "budget" | "advanced";
 type Severity = "ok" | "amber" | "red";
 
-const BASE_ENGINES = ["claude", "codex", "cursor"] as const;
+const BASE_ENGINES = ["claude", "codex", "cursor", "opencode"] as const;
 const ORDINARY_PROFILE_ROLES = new Set(["race", "bootstrap", "explore", "respond"]);
 // env var + default that govern the container worker image (server-side:
 // muteki/solver/container_exec.py WORKER_IMAGE). Surfaced in the Runtime tab so
@@ -96,6 +96,7 @@ const ENGINE_DEFAULTS: Record<string, { transport: string; wire_api: string; rol
   claude: { transport: "claude_code", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
   codex: { transport: "codex_cli", wire_api: "responses", roles: ["race", "bootstrap", "explore", "review"] },
   cursor: { transport: "cursor_agent", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
+  opencode: { transport: "opencode_cli", wire_api: "", roles: ["race", "bootstrap", "explore", "review"] },
 };
 
 // A unique profile id/name for a new instance of `engine` that won't collide with
@@ -180,7 +181,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   // For a custom endpoint (type "api") this names WHICH agent the base_url+key
   // overrides — persisted as the account's ENGINE marker so the panel can bind &
   // display it instead of an orphan "api".
-  const [accountApiEngine, setAccountApiEngine] = useState<"claude" | "codex" | "cursor">("claude");
+  const [accountApiEngine, setAccountApiEngine] = useState<"claude" | "codex" | "cursor" | "opencode">("claude");
   const [accountSecret, setAccountSecret] = useState("");
   const [accountBaseUrl, setAccountBaseUrl] = useState("");
   const [accountStatus, setAccountStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -362,7 +363,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   const engineOptions = useMemo(
     () => workerProfiles.length > 0
       ? workerProfiles.map((p) => p.name || p.id)
-      : ["claude", "codex", "cursor"],
+      : ["claude", "codex", "cursor", "opencode"],
     [workerProfiles]
   );
   const reviewOptions = useMemo(() => {
@@ -625,7 +626,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
   };
 
   const isDefaultLikeAccountId = (id: string) =>
-    id.trim() === "" || /^(claude|codex|cursor)-main$/.test(id.trim());
+    id.trim() === "" || /^(claude|codex|cursor|opencode)-main$/.test(id.trim());
 
   const onAccountTypeChange = (next: AccountType) => {
     setAccountType(next);
@@ -633,14 +634,14 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
     if (isDefaultLikeAccountId(accountId)) setAccountId(`${targetEngine}-main`);
   };
 
-  const onAccountApiEngineChange = (next: "claude" | "codex" | "cursor") => {
+  const onAccountApiEngineChange = (next: "claude" | "codex" | "cursor" | "opencode") => {
     setAccountApiEngine(next);
     if (isDefaultLikeAccountId(accountId)) setAccountId(`${next}-main`);
   };
 
   // Pre-fill the account form for a specific engine and bring it into view (used
   // by the per-card "configure account →" deep-link and the Accounts blocker).
-  const prefillAccount = (engine: "claude" | "codex" | "cursor") => {
+  const prefillAccount = (engine: "claude" | "codex" | "cursor" | "opencode") => {
     setTab("accounts");
     setEditingAccount(null);
     setAccountType(engine);
@@ -686,11 +687,11 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
       // a.engine carries the target_engine for a marked endpoint; fall back to
       // the explicit detail, else default to claude.
       setAccountApiEngine(
-        (target || (a.engine !== "api" ? a.engine : "claude")) as "claude" | "codex" | "cursor",
+        (target || (a.engine !== "api" ? a.engine : "claude")) as "claude" | "codex" | "cursor" | "opencode",
       );
     } else {
       setAccountType(a.engine as AccountType);
-      if (a.engine === "claude" || a.engine === "codex" || a.engine === "cursor") {
+      if (a.engine === "claude" || a.engine === "codex" || a.engine === "cursor" || a.engine === "opencode") {
         setAccountApiEngine(a.engine);
       }
     }
@@ -1099,7 +1100,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                           <div className="ws2-blocker">
                             <Icon name="alert" size={12} />
                             <span>{t("settings.blockerAccount", { engine: blocker })}</span>
-                            <button type="button" className="ws-jump" onClick={() => prefillAccount(blocker as "claude" | "codex" | "cursor")}>
+                            <button type="button" className="ws-jump" onClick={() => prefillAccount(blocker as "claude" | "codex" | "cursor" | "opencode")}>
                               {t("settings.blockerGoAccount")}
                             </button>
                           </div>
@@ -1220,7 +1221,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                               <Icon name="plug" size={12} /> {auth?.testing ? t("settings.testing") : t("settings.testConn")}
                             </button>
                           ) : (
-                            <button className="ws-save sm" type="button" onClick={() => prefillAccount(p.engine as "claude" | "codex" | "cursor")}>
+                            <button className="ws-save sm" type="button" onClick={() => prefillAccount(p.engine as "claude" | "codex" | "cursor" | "opencode")}>
                               <Icon name="plug" size={12} /> {t("settings.acctAdd")}
                             </button>
                           )}
@@ -1306,6 +1307,7 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                         <option value="claude">{t("settings.typeClaudeToken")}</option>
                         <option value="codex">{t("settings.typeCodexAuth")}</option>
                         <option value="cursor">{t("settings.typeCursorKey")}</option>
+                        <option value="opencode">{t("settings.typeOpencodeAuth")}</option>
                         <option value="api">{t("settings.typeCustomEndpoint")}</option>
                       </select>
                     </div>
@@ -1314,10 +1316,11 @@ export function WorkerSettings({ open, onClose }: { open: boolean; onClose: () =
                         <div className="ws-field">
                           <label>{t("settings.accountTargetEngine")}</label>
                           <select value={accountApiEngine}
-                            onChange={(e) => onAccountApiEngineChange(e.target.value as "claude" | "codex" | "cursor")}>
+                            onChange={(e) => onAccountApiEngineChange(e.target.value as "claude" | "codex" | "cursor" | "opencode")}>
                             <option value="claude">claude</option>
                             <option value="codex">codex</option>
                             <option value="cursor">cursor</option>
+                            <option value="opencode">opencode</option>
                           </select>
                         </div>
                         {accountApiEngine === "codex" && (

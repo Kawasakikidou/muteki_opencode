@@ -1003,8 +1003,11 @@ class CliSolver:
         # Installed deployment (pip/wheel; skills/ not adjacent to the package):
         # fall back to the engine-specific user-scope copy installed by
         # scripts/install_blackboard_skill.sh. Claude/Cursor read ~/.claude/skills;
-        # Codex reads ~/.agents/skills.
-        skill_root = ".agents" if self.driver.name == "codex" else ".claude"
+        # Codex reads ~/.agents/skills; opencode reads ~/.config/opencode/skills.
+        skill_root = {
+            "codex": ".agents",
+            "opencode": ".config/opencode",
+        }.get(self.driver.name, ".claude")
         return os.path.expanduser(
             f"~/{skill_root}/skills/muteki-blackboard/blackboard.py")
 
@@ -1291,6 +1294,31 @@ class CliSolver:
             endpoint = (env.get("CURSOR_ENDPOINT") or "").strip()
             if endpoint and "--endpoint" not in out:
                 out = insert_before_prompt(out, ["--endpoint", endpoint])
+
+        if self.driver.name == "opencode":
+            # opencode 没有 CLI 级工具禁用参数(不同于 claude 的
+            # --disallowed-tools / codex 的 --no-search):通过注入内联
+            # OPENCODE_CONFIG_CONTENT 禁用 web 工具(opencode 运行时合并)。
+            # web_access 存在 solver 上而非 argv 中 —— 与上面 cursor 的
+            # endpoint 同一接缝(env 而非 argv)。
+            extra = (env.get("MUTEKI_OPENCODE_CONFIG_EXTRA") or "").strip()
+            content = {}
+            if extra:
+                # 可选的 MCP / 模型 / provider 覆盖(muteki-for-ctf):
+                # 操作员把一段 JSON(如 {"mcp": {"fetch": {...}}})放进
+                # MUTEKI_OPENCODE_CONFIG_EXTRA,opencode 运行时与全局配置
+                # 合并 —— 这是给 worker 挂 VulnClaw 风格 MCP 服务器的通道。
+                try:
+                    parsed = json.loads(extra)
+                    if isinstance(parsed, dict):
+                        content.update(parsed)
+                except json.JSONDecodeError:
+                    pass  # 非法 JSON 静默忽略,不阻断 run
+            if not self.web_access:
+                content.setdefault("tools", {}).update(
+                    {"webfetch": False, "websearch": False})
+            if content:
+                env["OPENCODE_CONFIG_CONTENT"] = json.dumps(content)
         return out
 
     async def _run_streaming(self, argv: list[str], *, cwd: str, timeout: int) -> CliResult:

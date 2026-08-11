@@ -58,12 +58,20 @@ WORKER_MODEL_OPTIONS: dict[str, list[ModelOption]] = {
         {"id": "claude-4.5-sonnet", "label": "Sonnet 4.5"},
         {"id": "claude-4.5-sonnet-thinking", "label": "Sonnet 4.5 Thinking"},
     ],
+    # opencode 引擎:模型 ID 用 provider/model 格式(-m 参数),空 = 引擎默认。
+    # 实际可选模型取决于 opencode 里配置的 provider(auth.json)。
+    "opencode": [
+        {"id": "", "label": "(default)"},
+        {"id": "deepseek/deepseek-v4-flash", "label": "DeepSeek V4 Flash"},
+        {"id": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro"},
+    ],
 }
 
 _CONTAINER_BIN = {
     "claude": "claude",
     "codex": "codex",
     "cursor": "/home/kali/.local/bin/cursor-agent",
+    "opencode": "opencode",
 }
 
 _CONTAINER_BASE_ENV = {

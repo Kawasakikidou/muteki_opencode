@@ -99,6 +99,16 @@ DEFAULT_WORKER_PROFILES = [
      "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "review"],
      "race": True, "max_running": 2, "max_review_running": 0, "priority": 30, "model": "",
      "enabled": True},
+    # opencode 引擎默认 seat:订阅式(宿主继承 opencode 登录)/ 或绑
+    # opencode-main 账户(容器模式必须,凭据经 XDG_DATA_HOME 投影注入)。
+    {"id": "opencode-sub-container", "name": "opencode-sub-container",
+     "engine": "opencode", "transport": "opencode_cli",
+     "auth": "subscription", "credential_mode": "subscription",
+     "credential_account": "opencode-main", "api_key_ref": "", "base_url": "",
+     "wire_api": "",
+     "runtime": "docker-web", "roles": ["race", "bootstrap", "explore", "review"],
+     "race": True, "max_running": 1, "max_review_running": 0, "priority": 40, "model": "",
+     "enabled": True},
 ]
 DEFAULT_ENGINES = [p["name"] for p in DEFAULT_WORKER_PROFILES]
 

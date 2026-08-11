@@ -480,6 +480,59 @@ def test_profile_model_is_inserted_before_prompt_for_cli_drivers():
     assert out[-3:] == ["--model", "deepseek-reasoner", "PROMPT"]
 
 
+def test_opencode_offline_injects_web_tool_deny():
+    # 离线评估:opencode 没有 CLI 级工具禁用参数,通过内联
+    # OPENCODE_CONFIG_CONTENT 禁用 webfetch/websearch(env 注入)。
+    ch = Challenge(
+        id="opencode-offline",
+        name="opencode-offline",
+        category="misc",
+        description="offline",
+        flag_format="flag{...}",
+    )
+    solver = CliSolver(None, ch, engine="opencode")
+    solver.web_access = False
+    argv = ["/usr/bin/opencode", "run", "PROMPT"]
+
+    env = {}
+    solver._apply_runtime_argv(argv, env)
+
+    import json as _json
+    cfg = _json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert cfg["tools"] == {"webfetch": False, "websearch": False}
+
+
+def test_opencode_extra_config_merges_mcp_and_tools():
+    # MUTEKI_OPENCODE_CONFIG_EXTRA 提供操作员 JSON(如 MCP 服务器挂载),
+    # 与工具禁用合并注入;非法 JSON 静默忽略不阻断 run。
+    ch = Challenge(
+        id="opencode-mcp",
+        name="opencode-mcp",
+        category="misc",
+        description="mcp",
+        flag_format="flag{...}",
+    )
+    solver = CliSolver(None, ch, engine="opencode")
+    solver.web_access = False
+    argv = ["/usr/bin/opencode", "run", "PROMPT"]
+
+    env = {"MUTEKI_OPENCODE_CONFIG_EXTRA":
+           '{"mcp": {"fetch": {"type": "stdio", "command": "python3", '
+           '"args": ["mcp_server.py"]}}}'}
+    solver._apply_runtime_argv(argv, env)
+
+    import json as _json
+    cfg = _json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    assert cfg["mcp"]["fetch"]["command"] == "python3"   # 操作员 MCP 保留
+    assert cfg["tools"] == {"webfetch": False, "websearch": False}  # 离线禁用合并
+
+    # 非法 JSON:不抛异常,仅忽略
+    env2 = {"MUTEKI_OPENCODE_CONFIG_EXTRA": "{not json"}
+    solver.web_access = True
+    solver._apply_runtime_argv(argv, env2)
+    assert "OPENCODE_CONFIG_CONTENT" not in env2
+
+
 def test_swarm_profile_roles_and_capacity_are_hard_limits(tmp_path):
     ch = Challenge(
         id="profile-capacity",

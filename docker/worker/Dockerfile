@@ -120,9 +120,14 @@ RUN sudo curl -fsSL --retry 8 --retry-all-errors -o /tmp/miniforge.sh \
 
 # 5) Engine CLIs. claude/codex via npm (global, on PATH at /usr/local/bin).
 #    Credentials are injected at runtime — login state is NEVER baked.
+#    opencode 是第 4 引擎(muteki-for-ctf 接入):同样是 npm 包(openccode-ai),
+#    版本与宿主 WSL 开发环境的 opencode 保持一致(1.18.x),worker 通过
+#    `opencode run --format json` 被驱动;认证走 XDG_DATA_HOME 投影注入,
+#    不在镜像里烘焙任何 key。
 RUN npm install -g \
       @openai/codex@0.138.0 \
-      @anthropic-ai/claude-code@2.1.98
+      @anthropic-ai/claude-code@2.1.98 \
+      opencode-ai@1.18.16
 
 # cursor-agent is NOT an npm package — it installs via cursor.com/install into
 # ~/.local/bin. Do it as the kali user so it lands in kali's HOME (the worker runs as
@@ -169,7 +174,8 @@ RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
       /home/kali/.agents/skills/muteki-blackboard \
       /home/kali/.codex/skills/muteki-blackboard \
       /home/kali/.cursor/skills-cursor/muteki-blackboard \
-      /home/kali/.cursor/skills/muteki-blackboard && \
+      /home/kali/.cursor/skills/muteki-blackboard \
+      /home/kali/.config/opencode/skills/muteki-blackboard && \
     cp /opt/muteki/muteki-blackboard/SKILL.md \
       /home/kali/.claude/skills/muteki-blackboard/SKILL.md && \
     cp /opt/muteki/muteki-blackboard/blackboard.py \
@@ -190,13 +196,18 @@ RUN chmod +x /opt/muteki/muteki-blackboard/blackboard.py && \
       /home/kali/.cursor/skills/muteki-blackboard/SKILL.md && \
     cp /opt/muteki/muteki-blackboard/blackboard.py \
       /home/kali/.cursor/skills/muteki-blackboard/blackboard.py && \
-    chown -R kali:kali /home/kali/.claude /home/kali/.agents /home/kali/.codex /home/kali/.cursor && \
+    cp /opt/muteki/muteki-blackboard/SKILL.md \
+      /home/kali/.config/opencode/skills/muteki-blackboard/SKILL.md && \
+    cp /opt/muteki/muteki-blackboard/blackboard.py \
+      /home/kali/.config/opencode/skills/muteki-blackboard/blackboard.py && \
+    chown -R kali:kali /home/kali/.claude /home/kali/.agents /home/kali/.codex /home/kali/.cursor /home/kali/.config && \
     chmod +x \
       /home/kali/.claude/skills/muteki-blackboard/blackboard.py \
       /home/kali/.agents/skills/muteki-blackboard/blackboard.py \
       /home/kali/.codex/skills/muteki-blackboard/blackboard.py \
       /home/kali/.cursor/skills-cursor/muteki-blackboard/blackboard.py \
-      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py
+      /home/kali/.cursor/skills/muteki-blackboard/blackboard.py \
+      /home/kali/.config/opencode/skills/muteki-blackboard/blackboard.py
 
 # 9) workspace + control dir; supervisor as ENTRYPOINT (PID1, replaces sleep infinity).
 RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
@@ -208,7 +219,7 @@ RUN mkdir -p /home/kali/workspace && chown kali:kali /home/kali/workspace && \
 # --build-arg IMAGE_VERSION=<version>.
 ARG IMAGE_VERSION=dev
 LABEL org.opencontainers.image.title="muteki-worker" \
-      org.opencontainers.image.description="Kali muteki worker: full CTF toolchain + reverse-connector + 3 agent CLIs" \
+      org.opencontainers.image.description="Kali muteki worker: full CTF toolchain + reverse-connector + 4 agent CLIs (claude/codex/cursor/opencode)" \
       org.opencontainers.image.version="${IMAGE_VERSION}"
 
 WORKDIR /home/kali/workspace
