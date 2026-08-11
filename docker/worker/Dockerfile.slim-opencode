@@ -1,0 +1,29 @@
+# 增量镜像:官方 slim worker(supervisor + 引擎 CLI,0.48GB)+ opencode + ctf-kb。
+# 用于"即开即用 docker 压缩包"交付:体积小(压缩后 ~300MB),目标机器加载即用。
+# 注意:slim 不含 Kali 工具链(ghidra/sage/pwntools 重型件),worker 需要时
+# 可在线安装(有 NOPASSWD sudo)—— 与"排除可联网重建内容"的交付原则一致。
+#
+# 构建(上下文 = docker/worker/,先同步 skill 文件,见 build-slim-opencode.sh):
+#   docker build --platform linux/amd64 --load \
+#     -f Dockerfile.slim-opencode -t muteki-worker-slim-opencode:latest .
+FROM ghcr.io/fishcodetech/muteki-worker-slim:latest
+
+# 1) opencode 引擎:npm 全局 → /usr/local/bin(与 claude/codex 同路径,
+#    container_exec._CONTAINER_BIN["opencode"]="opencode" 直接命中)。
+#    版本与宿主 WSL 开发环境一致;认证运行时注入,不烘焙 key。
+RUN npm install -g opencode-ai@1.18.16
+
+# 2) 黑板 skill + VulnClaw ctf-kb 知识 skill → opencode 全局 skills 目录
+#    (~/.config/opencode/skills,与 swarm._BLACKBOARD_SKILL_LINKS 约定一致)。
+USER kali
+RUN mkdir -p /home/kali/.config/opencode/skills/muteki-blackboard
+USER root
+COPY ./blackboard.SKILL.md /home/kali/.config/opencode/skills/muteki-blackboard/SKILL.md
+COPY ./blackboard.py /home/kali/.config/opencode/skills/muteki-blackboard/blackboard.py
+COPY ./ctf-kb/ /home/kali/.config/opencode/skills/
+RUN chown -R kali:kali /home/kali/.config && \
+    find /home/kali/.config/opencode/skills -name "*.py" -exec chmod +x {} +
+
+LABEL org.opencontainers.image.title="muteki-worker-slim-opencode" \
+      org.opencontainers.image.description="muteki slim worker + opencode engine + ctf-kb skills (交付用增量镜像)" \
+      org.opencontainers.image.version="ctf-0.1"
