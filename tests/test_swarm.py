@@ -133,6 +133,40 @@ def test_cli_race_three_engines(challenge, tmp_path: Path) -> None:
     assert len({s.solver_id for s in solvers}) == 3
 
 
+async def test_cli_race_respects_wall_clock_budget(challenge, tmp_path, monkeypatch):
+    # 预算回归:cli_race 路径此前不检查 wall_clock_budget(只在 coordinator
+    # 路径生效),batch/offline 模式(coordinator=False)下一个 worker 能跑满
+    # 整个单轮超时(实测 AES 题 1018s)。有限预算必须能掐停 race。
+    from muteki.solver.types import SolveOutcome
+    import muteki.swarm.swarm as sw
+    sandbox = SandboxManager(root=tmp_path / "sbx")
+    swarm = Swarm(
+        challenge, [ModelSpec(solver_id="seat", model="mock")],
+        llm=None, sandbox=sandbox,
+        executor="cli", cli_race=True,
+        engines=["opencode"], wall_clock_budget=0.2,
+        coordinator=False,
+    )
+
+    class SlowWorker:
+        solver_id = "cli-opencode"
+        async def run(self):
+            await asyncio.sleep(60)      # 远超预算:不掐停会挂 60s
+            return SolveOutcome(False, None, 1, None, "slow")
+
+    monkeypatch.setattr(swarm, "_build_solvers", lambda: [SlowWorker()])
+    swarm._healthy_engines = lambda: ["opencode"]
+
+    t0 = time.monotonic()
+    outcome = await swarm.run()
+    elapsed = time.monotonic() - t0
+
+    assert outcome.solved is False
+    assert outcome.reason == "budget_exhausted"
+    assert elapsed < 30, f"race 预算未生效,跑了 {elapsed:.1f}s"
+    assert swarm._budget_exhausted_kind == "wall_clock_budget_exhausted"
+
+
 def test_cli_race_drops_unhealthy_cursor(challenge, tmp_path: Path) -> None:
     # cursor down (e.g. not logged in) → race runs claude + codex only.
     solvers = _cli_swarm(challenge, tmp_path, cli_race=True,

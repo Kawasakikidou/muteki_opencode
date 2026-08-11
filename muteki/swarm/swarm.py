@@ -1382,6 +1382,7 @@ class Swarm:
                 pass
 
     async def _run_race(self) -> SwarmOutcome:
+        import time  # noqa: PLC0415 — 与 _healthy_engines 的局部导入风格一致
         solvers = self._build_solvers()
         hitl_task: Optional[asyncio.Task] = None
         if self.hitl_inbox is not None:
@@ -1393,11 +1394,26 @@ class Swarm:
         winner: Optional[str] = None
         flag: Optional[str] = None
 
+        # wall-clock budget 对 race 路径同样生效(此前只在 coordinator 路径
+        # 检查 —— batch/offline 模式 coordinator=False 时预算形同虚设,一个
+        # worker 一轮可以跑完整个 2400s 默认单轮超时,如 run-XXXX AES 题
+        # 1018s 才结束)。有限预算到期 → 停掉所有 worker,按预算耗尽收尾。
+        t0 = time.monotonic()
+
         pending = set(tasks.keys())
         try:
             while pending:
+                # 剩余预算用作 wait 超时:asyncio.wait 在 worker 全部阻塞时会
+                # 一直睡,预算到期根本醒不过来 —— 必须定期醒来检查预算。
+                remaining = None
+                if self.wall_clock_budget != float("inf"):
+                    remaining = self.wall_clock_budget - (time.monotonic() - t0)
+                    if remaining <= 0:
+                        self._budget_exhausted_kind = "wall_clock_budget_exhausted"
+                        break
                 done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                    timeout=remaining,
                 )
                 for t in done:
                     s = tasks[t]
@@ -1509,7 +1525,11 @@ class Swarm:
             except Exception:
                 pass
         await self._emit_run_finished(flag=None, solved=False)
-        return SwarmOutcome(False, None, None, per_solver, "no solver found a flag")
+        # 预算耗尽与"没有 worker 解出"区分开,调用方(web / batch)可以据此
+        # 报不同的收尾原因(budget_exhausted vs 正常失败)。
+        reason = ("budget_exhausted" if self._budget_exhausted_kind
+                  else "no solver found a flag")
+        return SwarmOutcome(False, None, None, per_solver, reason)
 
     # ════════════════════════════════════════════════════════════════════════
     # Coordinator: evidence-driven plan / dispatch loop
@@ -1886,6 +1906,10 @@ class Swarm:
             env["MUTEKI_CREDENTIAL_ACCOUNT_ID"] = profile["credential_account"]
             if profile.get("model"):
                 env["MUTEKI_WORKER_MODEL"] = str(profile["model"])
+        # 无 profile 的路径(batch 比赛模式等):允许 MUTEKI_WORKER_MODEL 环境
+        # 变量直接钉模型 —— 与 MUTEKI_* 配置哲学一致,也保留"换模型"接口。
+        elif os.environ.get("MUTEKI_WORKER_MODEL", "").strip():
+            env["MUTEKI_WORKER_MODEL"] = os.environ["MUTEKI_WORKER_MODEL"].strip()
         if self.worker_root is not None and container is not None:
             base = (self.workspace_root or self.worker_root.parent)
             home_host = base / "homes" / label

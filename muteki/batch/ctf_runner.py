@@ -138,6 +138,7 @@ async def _run_one(spec: dict[str, Any], cfg: "BatchConfig", work_root: Path,
 @dataclass
 class BatchConfig:
     engines: list[str] = field(default_factory=lambda: ["opencode"])
+    model: str = ""             # 空 = opencode 全局默认(见 ~/.config/opencode/opencode.jsonc)
     timeout: int = 300          # 每题墙钟预算(秒)
     backend: str = "local"      # local | container
     accounts_root: Optional[str] = None
@@ -193,10 +194,15 @@ async def _main(manifest_path: str, report_path: str, workers: int) -> int:
     manifest = load_manifest(Path(manifest_path))
     cfg = BatchConfig(
         engines=[str(e) for e in manifest.get("engines") or ["opencode"]],
+        model=str(manifest.get("model") or "").strip(),
         timeout=int(manifest.get("timeout") or 300),
         backend=str(manifest.get("backend") or "local"),
         accounts_root=os.environ.get("MUTEKI_ACCOUNTS_ROOT"),
     )
+    if cfg.model:
+        # manifest 指定模型 → 注入 MUTEKI_WORKER_MODEL(worker 透传 --model)。
+        # 更换模型接口:改 manifest 的 model 字段即可(如 deepseek/deepseek-v4-pro)。
+        os.environ["MUTEKI_WORKER_MODEL"] = cfg.model
     out_dir = Path(report_path).parent
     work_root = out_dir / "work"
     work_root.mkdir(parents=True, exist_ok=True)

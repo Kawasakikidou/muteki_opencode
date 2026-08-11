@@ -1,6 +1,7 @@
 {
   "_comment": "muteki CTF 比赛模式 manifest 示例。字段说明见 muteki/batch/README.md",
   "engines": ["opencode"],
+  "model": "opencode-go/deepseek-v4-flash",
   "timeout": 300,
   "backend": "local",
   "challenges": [

@@ -1313,13 +1313,16 @@ def test_reasoning_only_flag_is_rejected_run75379():
 
 def test_tool_result_flag_in_real_output_is_accepted_run75379():
     """The legitimate counterpart to (a): the SAME flag, when it appears in real
-    command output (a tool_result), IS accepted — provenance traces to evidence."""
+    command output (a tool_result), IS accepted — provenance traces to evidence.
+    NOTE: the flag value is a two-word token (flag{from-raw}); three-word
+    all-lowercase phrases (flag{real-from-output}) are rejected as placeholder
+    prose by the gate (2026-08 false-positive class)."""
     from muteki.solver.cli_driver import StreamStep
     s = _flag_solver()
-    real = "root@dc:~# type flag.txt\nFOUND_FLAG=flag{real-from-output}\n"
+    real = "root@dc:~# type flag.txt\nFOUND_FLAG=flag{from-raw}\n"
     asyncio.run(s._emit_step(StreamStep("tool_result", text=real, raw=real)))
-    assert s._already_found == {"flag{real-from-output}"}
-    assert s._stream_accepted == ["flag{real-from-output}"]
+    assert s._already_found == {"flag{from-raw}"}
+    assert s._stream_accepted == ["flag{from-raw}"]
 
 
 def test_flag_past_char_600_still_accepted_via_untruncated_raw_run75379():
@@ -1393,13 +1396,13 @@ def test_surface_unverified_flags_emits_for_untraceable_claim_run75379():
     the operator as `flag_unverified` (not silently dropped, not auto-solved) — the
     nested-ssh false-negative guard."""
     s = _flag_solver()
-    transcript = "FOUND_FLAG=flag{claimed-no-trace}\nI read it on the DC.\n"
+    transcript = "FOUND_FLAG=flag{claimed-9trace}\nI read it on the DC.\n"
     asyncio.run(s._surface_unverified_flags(transcript))
     unv = [e for e in s.bus.events
            if e.event_type is EventType.BLACKBOARD_DELTA
            and e.payload.get("kind") == "flag_unverified"]
     assert len(unv) == 1
-    assert unv[0].payload.get("flag") == "flag{claimed-no-trace}"
+    assert unv[0].payload.get("flag") == "flag{claimed-9trace}"
     assert unv[0].payload.get("reason")   # operator-facing reason present
     # an ACCEPTED flag is verified, not unverified — no event for it.
     s2 = _flag_solver()

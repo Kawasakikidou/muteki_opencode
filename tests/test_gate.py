@@ -133,6 +133,28 @@ def test_gate_rejects_truncated_flag_summary_from_prose():
                         flag_format=LOOSE, artifacts=None) is False
 
 
+def test_gate_rejects_natural_language_phrase_as_flag():
+    """2026-08 AES batch-run false positive: the worker echoed
+    `FOUND_FLAG=flag{real-from-output}` in its own tool output, which passed the
+    loose brace regex + the self-referential provenance check. All-lowercase
+    THREE+ hyphen/space-joined words are prose, not a recovered secret."""
+    for p in ["flag{real-from-output}", "flag{found-in-the-file}",
+              "flag{the real flag}", "flag{this-is-the-flag}",
+              "flag{flag-found-by-brute}"]:
+        assert gate.is_placeholder_flag(p) is True, p
+        assert gate.flag_ok(p, p, flag_format=LOOSE, artifacts=None) is False
+
+
+def test_gate_keeps_digit_mixed_and_two_word_flags():
+    # 含数字/下划线/混合大小写,以及两词连字符(真 flag 形态)都不能误杀。
+    for f in ["flag{real-3xp0rt-2026}", "flag{found-in_0utput}",
+              "flag{hello-world-9}", "flag{5ecret-Key}",
+              "flag{from-raw}", "flag{hello-world}"]:
+        assert gate.is_placeholder_flag(f) is False, f
+    # 三段全小写(a-b-c)按"自然语言短语"规则拒绝 —— 与规则一致。
+    assert gate.is_placeholder_flag("flag{a-b-c}") is True
+
+
 def test_gate_rejects_uuid_placeholder_run_0405():
     out = "the team board says we found {uuid} earlier"
     assert gate.flag_ok("{uuid}", out, flag_format=LOOSE, artifacts=None) is False

@@ -109,6 +109,19 @@ def is_placeholder_flag(flag: str) -> bool:
     # a body with no alphanumerics at all carries no real content
     if body and not re.search(r"[A-Za-z0-9]", body):
         return True
+    # Natural-language phrase disguised as a flag: body is ALL lowercase words
+    # joined by hyphens/spaces — at least THREE words ("real-from-output",
+    # "found-in-the-file", "the real flag"). Real flags essentially never look
+    # like that; they carry digits / underscores / mixed case / leet. This is
+    # the 2026-08 AES batch-run false positive: the worker "solved" by echoing
+    # `FOUND_FLAG=flag{real-from-output}` in its own tool output, which passed
+    # the loose brace regex + the self-referential provenance check. Two-word
+    # hyphenated bodies ("from-raw", "hello-world") stay ACCEPTED — they are a
+    # genuine flag shape (e.g. csawctf{from-raw}); the three-word floor keeps
+    # the gate from dropping them. Zero false flags is the bar, but so is not
+    # rejecting real flags that look like short hyphenated tokens.
+    if body and re.fullmatch(r"[a-z]+(?:[- ][a-z]+){2,}", body):
+        return True
     return False
 
 
