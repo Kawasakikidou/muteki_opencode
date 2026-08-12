@@ -33,6 +33,13 @@ sessions/
 eval_runs/
 knowledge/
 
+# Local challenge files staged for batch runs (not part of the distribution)
+attachments/
+work/
+battle_report.*
+manifest_*.json
+report_*.md
+
 # pytest / tooling caches
 .pytest_cache/
 .ruff_cache/
@@ -78,8 +85,4 @@ docs/internal-design/
 docs/wechat/
 docs/assets/wechat-promo/
 
-# 浜や粯闀滃儚鍘嬬缉鍖?浣撶Н澶?涓嶈繘 git;dist 閲屽彧璺熻釜 load.sh / README.md)
-dist/*.tar.gz
-!dist/load.sh
-!dist/README.md
 
