@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -21,17 +22,62 @@ class SessionStore:
     def __init__(self, root: str | Path = "sessions") -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        # Per-run append locks. Bounded (Round-5): a long-lived backend that saw
+        # thousands of distinct run ids would grow this dict forever — a finished
+        # run's lock is dead weight. On insert, if the table exceeds _MAX_LOCKS,
+        # evict an idle (non-held) entry first, else the oldest-inserted one.
         self._locks: dict[str, asyncio.Lock] = {}
+        self._MAX_LOCKS = 512
 
     def _path(self, run_id: str) -> Path:
-        # run_id is trusted internal (challenge id / uuid), but guard separators.
-        safe = run_id.replace("/", "_").replace("..", "_")
+        # H1b: REJECT — never sanitize — ids that could reach outside root on
+        # ANY platform. The old replace-only guard never touched `\` or drive
+        # prefixes: on Windows `root / "C:\\evil.jsonl"` keeps the WHOLE rhs
+        # (drive-qualified) and `\\server\share\x.jsonl` escapes via UNC —
+        # arbitrary JSONL read through replay(), arbitrary append through the
+        # bus sink. `..` / `.` / empty are rejected outright — and a `..`
+        # SUBSTRING too (Round-5: folding `a..b`→`a_b` collides two distinct
+        # run ids onto one jsonl); forward slashes keep the historical `_`
+        # replacement (batch challenge ids like "web/xss" are legitimate run
+        # ids). Raises ValueError — callers translate to 400 / skip, never
+        # fall through to a filesystem path.
+        s = str(run_id or "")
+        if not s or s in (".", "..") or ".." in s:
+            # Round-5: a `..` SUBSTRING (e.g. `a..b`) must be rejected, not
+            # replaced — folding it to `a_b` collides with the real `a_b` run
+            # id (two runs, one jsonl file, cross-contaminated event streams).
+            # The web whitelist (_RUN_ID_SAFE) already refuses `..`; this keeps
+            # direct callers (batch runner) on the same rule.
+            raise ValueError(f"unsafe run_id: {run_id!r}")
+        if "\\" in s or "\x00" in s:
+            raise ValueError(f"unsafe run_id: {run_id!r}")
+        if re.match(r"^[A-Za-z]:", s):  # drive prefix (C:evil is drive-relative on Windows)
+            raise ValueError(f"unsafe run_id: {run_id!r}")
+        safe = s.replace("/", "_")
         return self.root / f"{safe}.jsonl"
 
+    def path_for(self, run_id: str) -> Path:
+        """Public path helper — lets callers report/peek a run's events file
+        without reaching into the private `_path` (batch runner uses it)."""
+        return self._path(run_id)
+
     def _lock_for(self, run_id: str) -> asyncio.Lock:
-        if run_id not in self._locks:
-            self._locks[run_id] = asyncio.Lock()
-        return self._locks[run_id]
+        lock = self._locks.get(run_id)
+        if lock is not None:
+            return lock
+        if len(self._locks) >= self._MAX_LOCKS:
+            # evict any non-held lock first; if all are held, drop the oldest
+            # anyway (an append lock is a correctness nicety — worst case two
+            # appends to one file serialize in the OS instead)
+            for rid, lk in list(self._locks.items()):
+                if not lk.locked():
+                    del self._locks[rid]
+                    break
+            else:
+                del self._locks[next(iter(self._locks))]
+        lock = asyncio.Lock()
+        self._locks[run_id] = lock
+        return lock
 
     async def append(self, event: Event) -> None:
         path = self._path(event.run_id)

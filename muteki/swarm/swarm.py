@@ -377,6 +377,18 @@ class Swarm:
         # race-scout config. race_engines defaults to the full roster; pass a subset
         # to disable a worker (e.g. ["claude","codex"] drops cursor). Deduped, and
         # restricted to known engines so a typo can't silently launch nothing weird.
+        # run-fix: race-scout ONLY executes on the coordinator path
+        # (_run_coordinator). On the plain race path (cli_race=True,
+        # coordinator=False) the flag is a silent no-op — warn loudly so a batch
+        # caller that sets race_scout=True "for the recon round" learns it isn't
+        # getting one instead of misreading the config.
+        if race_scout and not coordinator:
+            import warnings
+            warnings.warn(
+                "race_scout=True has no effect under coordinator=False "
+                "(plain cli_race path): the scout layer only runs inside "
+                "_run_coordinator. Dropping the flag.", stacklevel=2)
+            race_scout = False
         self.race_scout = bool(race_scout)
         # explicit cold-start hint (see ctor arg + _is_cold_start). May also be
         # supplied via stage_policy.race["cold_start"] so config-driven relaunches
@@ -1401,6 +1413,13 @@ class Swarm:
         t0 = time.monotonic()
 
         pending = set(tasks.keys())
+        # run-fix: track the LAST reaped solver separately. The split-brain
+        # reconcile below can fire on a round whose `done` was EMPTY (e.g. a
+        # resume run where asyncio.wait returned on budget timeout but the graph
+        # already holds enough flags) — `s` from the loop above would be
+        # unbound there (UnboundLocalError). last_reaped stays None in that
+        # case and the reconcile falls back to a stable "graph" winner marker.
+        last_reaped = None
         try:
             while pending:
                 # 剩余预算用作 wait 超时:asyncio.wait 在 worker 全部阻塞时会
@@ -1417,6 +1436,7 @@ class Swarm:
                 )
                 for t in done:
                     s = tasks[t]
+                    last_reaped = s
                     try:
                         outcome = t.result()
                     except asyncio.CancelledError:
@@ -1453,7 +1473,7 @@ class Swarm:
                 if winner is None:
                     self._sync_flags_from_graph()
                     if self._flags_complete():
-                        winner = s.solver_id
+                        winner = (last_reaped.solver_id if last_reaped else "graph")
                         flag = self._found_flags[0] if self._found_flags else None
                         try:
                             await self.insight.all_flags_found(
@@ -2134,6 +2154,17 @@ class Swarm:
             return "worker_budget_exhausted"
         if self.cost_budget_usd is not None and self._current_cost_usd() >= self.cost_budget_usd:
             return "cost_budget_exhausted"
+        # F5: CostController's Budget object (global / per-challenge caps) was
+        # never consulted anywhere — wire the circuit breaker in so a configured
+        # Budget actually gates worker spawns. per-solver is intentionally
+        # skipped here (a fresh solver starts at 0).
+        if self.cost is not None:
+            try:
+                if (self.cost.over_budget("global")
+                        or self.cost.over_budget(f"challenge:{self.challenge.id}")):
+                    return "cost_budget_exhausted"
+            except Exception:
+                pass
         return None
 
     def _reserve_worker_spawn(self) -> None:
@@ -2306,8 +2337,9 @@ class Swarm:
         if self.shared_graph is None:
             return 0
         try:
-            return sum(1 for e in self.shared_graph.events()
-                       if e.get("kind") == "fact_added")
+            # run-fix: SQL COUNT instead of summing over events() — the old
+            # full-log materialization was O(n) per tick on long runs.
+            return self.shared_graph.count_events("fact_added")
         except Exception:
             return 0
 
@@ -2465,35 +2497,23 @@ class Swarm:
         concluded). Closing this lease loop is what lets the swarm recover an intent
         abandoned by a stuck worker — without it, a worker that hangs holding a claim
         would orphan that intent forever (claim_intent already honors expired leases,
-        but the coordinator never re-read them, so they were lost)."""
+        but the coordinator never re-read them, so they were lost).
+
+        The SQL (dispatch_state='active' + lease-expiry filter + housekeeping-last
+        ordering) lives in shared_graph.open_intents() — ONE implementation shared
+        with claim_intent, no more hand-rolled queries against the private
+        connection (run-fix). Route suppression / resource conflict / lane
+        inference stay here (graph domain calls)."""
         if self.shared_graph is None:
             return []
-        import time as _time
-        now = _time.time()
         try:
-            with self.shared_graph._lock:  # type: ignore[attr-defined]
-                rows = self.shared_graph._conn.execute(  # type: ignore[attr-defined]
-                    "SELECT intent_id, goal, worker_class, route_hash, branch_id, "
-                    "priority, lane_key, risk_class, resource_key FROM intents "
-                    # A/J: only dispatch_state='active' intents are dispatchable;
-                    # resume/retired/closed are held back even when status='open'.
-                    "WHERE dispatch_state='active' AND (status='open' "
-                    "   OR (status='claimed' AND lease_until IS NOT NULL "
-                    "       AND lease_until < ?)) "
-                    # run-75377: solving intents (MS17-010, RBCD, …) starved behind a
-                    # backlog of verify/review housekeeping at equal priority. Sort
-                    # housekeeping (verifier/review) LAST so flag-bearing work dispatches
-                    # first; priority/created_seq still break ties within each class.
-                    "ORDER BY CASE WHEN worker_class IN ('verifier','review') "
-                    "         THEN 1 ELSE 0 END, priority DESC, created_seq",
-                    (now,),
-                ).fetchall()
+            rows = self.shared_graph.open_intents()
             out: list[dict] = []
             inferred_lanes: list[tuple[str, str, str]] = []
             seen_routes: set[str] = set()
             for r in rows:
-                wc = r[2] or "code"
-                route = r[3] or ""
+                wc = r.get("worker_class") or "code"
+                route = r.get("route_hash") or ""
                 if (route and wc not in {"verifier", "review"}
                         and hasattr(self.shared_graph, "is_route_suppressed")
                         and self.shared_graph.is_route_suppressed(route)):
@@ -2502,9 +2522,9 @@ class Swarm:
                     if route in seen_routes:
                         continue
                     seen_routes.add(route)
-                lane_key = r[6] or ""
-                risk_class = r[7] or ""
-                resource_key = r[8] or ""
+                lane_key = r.get("lane_key") or ""
+                risk_class = r.get("risk_class") or ""
+                resource_key = r.get("resource_key") or ""
                 # E: dispatch preflight — skip an intent whose declared resource is
                 # currently locked by ANOTHER worker (route around it, don't collide).
                 if (resource_key and hasattr(self.shared_graph, "check_resource_conflicts")):
@@ -2517,33 +2537,31 @@ class Swarm:
                         pass
                 if not lane_key:
                     hint = self._lane_hint_from_text(
-                        str(r[1] or ""), require_control_hint=True)
+                        str(r.get("goal") or ""), require_control_hint=True)
                     lane_key = str(hint.get("lane_key") or "")
                     if lane_key:
                         risk_class = str(hint.get("risk_class") or risk_class or "")
-                        inferred_lanes.append((lane_key, risk_class, str(r[0] or "")))
+                        inferred_lanes.append((lane_key, risk_class,
+                                               str(r.get("intent_id") or "")))
                 out.append({
-                    "intent_id": r[0],
-                    "goal": r[1],
+                    "intent_id": r.get("intent_id"),
+                    "goal": r.get("goal"),
                     "worker_class": wc,
                     "route_hash": route,
-                    "branch_id": r[4] or "",
-                    "priority": int(r[5] or 0),
+                    "branch_id": r.get("branch_id") or "",
+                    "priority": int(r.get("priority") or 0),
                     "lane_key": lane_key,
                     "risk_class": risk_class,
                     "resource_key": resource_key,
                 })
             if inferred_lanes:
-                with self.shared_graph._lock:  # type: ignore[attr-defined]
-                    for lane_key, risk_class, intent_id in inferred_lanes:
-                        self.shared_graph._conn.execute(  # type: ignore[attr-defined]
-                            "UPDATE intents SET lane_key=?, risk_class=? "
-                            "WHERE challenge_id=? AND intent_id=? "
-                            "AND (lane_key IS NULL OR lane_key='')",
-                            (lane_key, risk_class or lane_key.split(":", 1)[0],
-                             self.challenge.id, intent_id),
-                        )
-                    self.shared_graph._conn.commit()  # type: ignore[attr-defined]
+                for lane_key, risk_class, intent_id in inferred_lanes:
+                    try:
+                        self.shared_graph.set_intent_lane(
+                            intent_id=intent_id, lane_key=lane_key,
+                            risk_class=risk_class)
+                    except Exception:
+                        pass
             return out
         except Exception:
             return []
@@ -2660,6 +2678,18 @@ class Swarm:
                 self._summarize_intent_async(it["intent_id"], it["goal"])
             return len(proposed)
         except Exception:
+            # F17: a planner parse failure used to be swallowed silently (0 intents
+            # → explore starvation → endless retry_bootstrap). Emit a blackboard
+            # marker so the deck + operator can SEE the planning round failed.
+            import logging as _logging
+            _logging.getLogger(__name__).exception("reason phase failed")
+            try:
+                if self.shared_graph is not None:
+                    self.shared_graph.add_coordinator_directive(
+                        actor="reason", action="reason_parse_failed",
+                        directive="reason planning round errored; skipped")
+            except Exception:
+                pass
             return 0
 
     def _summarize_intent_async(self, intent_id: str, goal: str) -> None:

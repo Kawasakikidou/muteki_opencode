@@ -38,6 +38,7 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 from muteki.models.solve_graph import Challenge, Evidence, SolveGraph
 from muteki.solver.result_codes import is_genuine_giveup
+from muteki.solver.workspace import is_clean_name, is_safe_relative_path
 
 
 # ── event types (C: append-only log) ─────────────────────────────────────────
@@ -255,6 +256,20 @@ class SharedGraph(Protocol):
     def claim_intent(self, *, worker: str, intent_id: str,
                      lease_s: float = 300.0) -> bool: ...
 
+    def open_intents(self) -> list[dict]: ...
+    """Dispatchable intents: status='open' PLUS claimed intents whose lease
+    expired (abandoned by a stuck worker), restricted to
+    dispatch_state='active' (resume/retired/closed are held back even when
+    status='open'). Returns raw rows as dicts; route/resource/lane filtering
+    stays with the caller."""
+
+    def set_intent_lane(self, *, intent_id: str, lane_key: str,
+                        risk_class: str = "") -> None:
+        """Backfill an inferred lane onto an intent that had none
+        (caller-side lane inference, see _open_intents). No-op-ish if the
+        intent already carries a lane."""
+        ...
+
     def conclude_intent(self, *, actor: str, intent_id: str,
                         result: str = "",
                         to_fact_seq: Optional[int] = None,
@@ -401,8 +416,13 @@ class SharedGraph(Protocol):
     def snapshot(self) -> SolveGraph: ...
 
     def invalidated_flags(self) -> set[str]: ...
-
     def events(self) -> list[dict]: ...
+
+    def count_events(self, kind: str) -> int: ...
+    """COUNT of events of `kind` for this challenge, at the SQL layer — the
+    swarm's progress checkpoint used to sum over events() (full-table scan
+    per tick on long runs)."""
+
     def events_since(self, after_seq: int, kinds: Optional[list[str]] = None) -> list[dict]: ...
 
     def to_summary(self, max_evidence: int = 16,
@@ -742,6 +762,20 @@ class SQLiteSharedGraph:
             self._conn.commit()
         except sqlite3.OperationalError:
             pass
+        # run-fix: index the event log for the read paths that run EVERY tick —
+        # count_events(kind) and events_since(seq) were full-table scans on long
+        # runs. Idempotent, safe on existing DBs.
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_events_chal_seq "
+            "ON events(challenge_id, seq)",
+            "CREATE INDEX IF NOT EXISTS idx_events_chal_kind "
+            "ON events(challenge_id, kind, seq)",
+        ):
+            try:
+                self._conn.execute(ddl)
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass
 
     def _table_exists(self, name: str) -> bool:
         with self._lock:
@@ -795,7 +829,6 @@ class SQLiteSharedGraph:
         with self._lock:
             self._conn.close()
 
-    # ── append (C: INSERT only) ─────────────────────────────────────────
     def _append(self, kind: str, actor: str, payload: dict, *,
                 artifact_id: Optional[str] = None, verified: bool = False,
                 confidence: float = 1.0, dedupe_key: Optional[str] = None) -> int:
@@ -812,10 +845,24 @@ class SQLiteSharedGraph:
                 )
                 self._conn.commit()
                 return int(cur.lastrowid or 0)
-            except sqlite3.IntegrityError:
-                # dedupe_key collision → same event already appended; no-op.
+            except sqlite3.IntegrityError as exc:
                 self._conn.rollback()
-                return -1
+                # dedupe_key collision → same event already appended; no-op.
+                # ONLY a UNIQUE conflict on events.dedupe_key counts — matching
+                # the errorcode is exact (SQLITE_CONSTRAINT_UNIQUE), and the
+                # column name check makes sure it is THIS table's UNIQUE column
+                # (Round-5: no more bare message-substring matching — the text
+                # "UNIQUE constraint failed: …" is stable today but is an
+                # implementation detail; the errorcode is the API). Any other
+                # IntegrityError (FK / NOT NULL / CHECK) is a real data bug:
+                # re-raise instead of silently swallowing it as a "collision".
+                if dedupe_key and (
+                    getattr(exc, "sqlite_errorcode", None)
+                        == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+                    and "events.dedupe_key" in str(exc)
+                ):
+                    return -1
+                raise
 
     def add_evidence(self, *, actor: str, source: str, fact: str,
                      artifact_id: Optional[str] = None, verified: bool = False,
@@ -2487,6 +2534,49 @@ class SQLiteSharedGraph:
             self._append(EV_INTENT_CLAIMED, worker, {"intent_id": intent_id})
         return won
 
+    def open_intents(self) -> list[dict]:
+        """Dispatchable intents (single SQL source of truth — the swarm's
+        `_open_intents` used to re-implement this filter against the private
+        connection, a drift hazard; run-fix moves the query HERE so both the
+        lease-expiry rule and the dispatch_state='active' rule live once).
+
+        Returns: status='open' PLUS claimed-with-expired-lease rows,
+        restricted to dispatch_state='active'; housekeeping classes
+        (verifier/review) sorted LAST so flag-bearing work dispatches first.
+        Route suppression / resource conflict / lane inference stay with the
+        caller (they need graph domain calls, not raw SQL)."""
+        _COLS = ("intent_id", "goal", "worker_class", "route_hash", "branch_id",
+                 "priority", "lane_key", "risk_class", "resource_key")
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT intent_id, goal, worker_class, route_hash, branch_id, "
+                "priority, lane_key, risk_class, resource_key FROM intents "
+                "WHERE challenge_id=? AND dispatch_state='active' "
+                "  AND (status='open' "
+                "       OR (status='claimed' AND lease_until IS NOT NULL "
+                "           AND lease_until < ?)) "
+                "ORDER BY CASE WHEN worker_class IN ('verifier','review') "
+                "         THEN 1 ELSE 0 END, priority DESC, created_seq",
+                (self.challenge.id, now),
+            ).fetchall()
+        return [dict(zip(_COLS, r)) for r in rows]
+
+    def set_intent_lane(self, *, intent_id: str, lane_key: str,
+                        risk_class: str = "") -> None:
+        """Backfill an inferred lane onto an intent that had none (caller-side
+        lane inference). Keeps the UPDATE out of the swarm's hands (it used to
+        write straight to the private connection)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE intents SET lane_key=?, risk_class=? "
+                "WHERE challenge_id=? AND intent_id=? "
+                "AND (lane_key IS NULL OR lane_key='')",
+                (lane_key, risk_class or lane_key.split(":", 1)[0],
+                 self.challenge.id, intent_id),
+            )
+            self._conn.commit()
+
     @staticmethod
     def _norm_activity_key(key: str) -> str:
         """Normalize an activity key so 'nmap 8.130.96.176' and 'NMAP:8.130.96.176'
@@ -2648,12 +2738,26 @@ class SQLiteSharedGraph:
 
         The body lives in workspace/shared CAS; this graph is the source of truth
         for inheritance state.
+
+        Round-3 audit: the pocs table is WORKER-WRITABLE and its rows are later
+        spliced into filesystem paths by the inheritance CONSUMER
+        (CliSolver._link_inherited_pocs). Reject poisoned values at the WRITE
+        side too — a `..`-laden poc_id / name / path must never be recorded in
+        the first place (defense in depth alongside the consumer-side check).
         """
+        poc_id = str(poc_id or "")
+        name = str(name or Path(path).name)
+        if not is_clean_name(poc_id):
+            raise ValueError(f"unsafe poc_id: {poc_id!r}")
+        if not is_clean_name(name):
+            raise ValueError(f"unsafe poc name: {name!r}")
+        if not is_safe_relative_path(str(path or "")):
+            raise ValueError(f"unsafe poc path: {path!r}")
         status = status if status in {"available", "wip", "directional", "spent", "quarantined"} else "available"
         payload = {
             "poc_id": poc_id,
             "intent_id": intent_id,
-            "name": name or Path(path).name,
+            "name": name,
             "path": path,
             "entry_command": entry_command,
             "status": status,
@@ -2891,6 +2995,18 @@ class SQLiteSharedGraph:
                         "payload": json.loads(payload), "artifact_id": aid,
                         "verified": bool(verified), "confidence": conf})
         return out
+
+    def count_events(self, kind: str) -> int:
+        """COUNT of `kind` at the SQL layer (no full event-log materialization).
+        The swarm's progress checkpoint (fact_added) calls this every tick; on a
+        long run with tens of thousands of events, the old events() scan was
+        O(n) per tick."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM events WHERE challenge_id=? AND kind=?",
+                (self.challenge.id, str(kind)),
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
 
     def recent_events(self, limit: int = 40) -> list[dict]:
         """Last `limit` events, oldest-first, filtered to this challenge.

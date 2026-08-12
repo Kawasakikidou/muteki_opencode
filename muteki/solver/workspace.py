@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 
 def workspace_root_for_worker(wd: str | Path) -> Path:
@@ -24,11 +24,16 @@ def workspace_root_for_worker(wd: str | Path) -> Path:
     Normal web runs use ``workspace/workers/<worker-id>``.  Unit tests and older
     callers may pass an arbitrary cwd; in that case the cwd's parent becomes a
     lightweight workspace root so local execution still uses the CAS protocol.
-    """
+
+    F36: walk UP to the nearest `workers` ancestor — a worker that created
+    NESTED subdirectories (workers/a/b/c) used to resolve to workers/a as the
+    "root" and seed the CAS layout into the worker's own subtree."""
     p = Path(wd).resolve()
-    if p.parent.name == "workers":
-        return p.parent.parent
-    return p.parent
+    while p.parent != p:
+        if p.name == "workers":
+            return p.parent
+        p = p.parent
+    return Path(wd).resolve().parent
 
 
 def ensure_workspace(root: str | Path, *, runtime: dict[str, Any] | None = None) -> Path:
@@ -126,6 +131,67 @@ def relative_symlink(link: str | Path, target: str | Path) -> None:
     _replace_symlink(link, Path(rel))
 
 
+def is_clean_name(name: str) -> bool:
+    """F35: a clean name must be a single safe path segment. `..` / `.` / empty
+    / separators were silently accepted (Path(name).name leaves `..` intact) and
+    let a hostile attachment name escape the CAS layout (link created in the
+    worker dir's PARENT, or symlink onto the inputs dir itself).
+
+    Public so the PoC inheritance CONSUMER side (CliSolver._link_inherited_pocs)
+    and the shared_graph WRITE side (save_poc) enforce the same rule — the pocs
+    table is worker-writable, so a value that is fine at write time must still be
+    re-validated before it is spliced into a filesystem path."""
+    n = str(name or "")
+    return bool(n) and n not in (".", "..") and "/" not in n and "\\" not in n and "\x00" not in n
+
+
+def is_safe_relative_path(rel: str) -> bool:
+    """A relative, non-escaping path string: no `..` segment, no absolute /
+    drive-qualified path, no NUL. Worker-written `path` columns (PoC rows,
+    shared artifacts) must pass this at the WRITE side; the consumer re-checks
+    with resolve_inside before splicing into a real filesystem path."""
+    r = str(rel or "")
+    if not r or "\x00" in r:
+        return False
+    p = Path(r)
+    # Windows quirk: `Path("/etc/passwd").is_absolute()` is False there (no
+    # drive), yet `root / "/etc/passwd"` still resolves to `<drive>:/etc/passwd`
+    # — OUTSIDE root. A leading separator must be rejected on every platform.
+    if r.startswith("/") or r.startswith("\\"):
+        return False
+    if p.is_absolute() or p.drive:
+        return False
+    return ".." not in p.parts
+
+
+def resolve_inside(root: str | Path, rel: str) -> Optional[Path]:
+    """Resolve `root / rel` and return the resolved path ONLY if it stays inside
+    `root`. Returns None for empty / absolute / drive-qualified / `..`-escaping
+    relative paths.
+
+    Third-round audit: the PoC inheritance consumer links `root / path` from
+    worker-written rows — a path like `../../../etc/passwd` would escape the
+    workspace root and create a symlink pointing OUTSIDE the CAS. Every caller
+    must route worker-controlled relative paths through this before linking."""
+    root_r = Path(root).resolve()
+    rel = str(rel or "")
+    if not rel:
+        return None
+    p = Path(rel)
+    # Windows quirk: leading separator without drive is not is_absolute() there,
+    # but `root / "/etc/passwd"` escapes to `<drive>:/etc/passwd` anyway.
+    if rel.startswith("/") or rel.startswith("\\"):
+        return None
+    if p.is_absolute() or p.drive:  # drive-qualified (C:foo) is absolute-ish on Windows
+        return None
+    cand = (root_r / p).resolve()
+    try:
+        cand.relative_to(root_r)
+    except ValueError:
+        return None
+    return cand
+
+
 def materialize_input(root: str | Path, src: str | Path, *, name: str | None = None) -> dict[str, Any]:
     root = ensure_workspace(root)
     srcp = Path(src).resolve()
@@ -134,7 +200,13 @@ def materialize_input(root: str | Path, src: str | Path, *, name: str | None = N
     digest = sha256_path(srcp)
     obj = object_path(root, "inputs", digest)
     _atomic_materialize(srcp, obj)
-    clean_name = Path(name or srcp.name).name
+    # F35: validate the RAW name BEFORE Path().name — on Windows `Path("a\\b").name`
+    # is "b", which would smuggle a separator past the check and still place the
+    # link oddly.
+    raw_name = name if name is not None else srcp.name
+    if not is_clean_name(str(raw_name)):
+        raise ValueError(f"unsafe attachment name: {raw_name!r}")
+    clean_name = Path(str(raw_name)).name
     by_name = root / "inputs" / "by-name" / clean_name
     relative_symlink(by_name, obj)
     write_manifest(root)
@@ -163,7 +235,11 @@ def materialize_shared_artifact(
     digest = sha256_path(srcp)
     obj = object_path(root, "shared", digest)
     _atomic_materialize(srcp, obj)
-    clean_name = Path(name or srcp.name).name
+    # F35: raw-name validation BEFORE Path().name (see materialize_input).
+    raw_name = name if name is not None else srcp.name
+    if not is_clean_name(str(raw_name)):
+        raise ValueError(f"unsafe artifact name: {raw_name!r}")
+    clean_name = Path(str(raw_name)).name
     link = root / "shared" / "links" / clean_name
     relative_symlink(link, obj)
     row = {
@@ -185,16 +261,26 @@ def materialize_shared_artifact(
 
 def link_input_into_worker(root: str | Path, wd: str | Path, name: str) -> Path:
     root = ensure_workspace(root)
-    dst = Path(wd) / Path(name).name
-    src = root / "inputs" / "by-name" / Path(name).name
+    # F35: raw-name validation BEFORE Path().name (see materialize_input).
+    if not is_clean_name(str(name)):
+        raise ValueError(f"unsafe link name: {name!r}")
+    n = Path(str(name)).name
+    dst = Path(wd) / n
+    src = root / "inputs" / "by-name" / n
     relative_symlink(dst, src)
     return dst
 
 
 def link_shared_into_worker(root: str | Path, wd: str | Path, name: str, sha256: str) -> Path:
     root = ensure_workspace(root)
-    dst = Path(wd) / "shared" / Path(name).name
+    if not is_clean_name(str(name)):
+        raise ValueError(f"unsafe link name: {name!r}")
+    n = Path(str(name)).name
+    dst = Path(wd) / "shared" / n
     src = object_path(root, "shared", sha256)
+    # F37: a bad sha creates a dangling link silently — fail loudly instead.
+    if not src.exists():
+        raise FileNotFoundError(f"shared object missing: {src}")
     relative_symlink(dst, src)
     return dst
 
@@ -260,8 +346,15 @@ def cleanup_worker_scratch(worker_root: str | Path, *, keep: Iterable[str] = ())
     if not root.exists():
         return removed
     for child in root.iterdir():
-        if not child.is_dir() or child.name.startswith("_") or child.name in keep_set:
+        if child.name.startswith("_") or child.name in keep_set:
             continue
-        shutil.rmtree(child, ignore_errors=True)
-        removed.append(child)
+        if child.is_symlink():
+            # F38: a symlink pointing AT a directory used to pass is_dir() and
+            # rmtree it (OSError swallowed by ignore_errors) — the dangling link
+            # lingered. unlink the link itself.
+            child.unlink(missing_ok=True)
+            removed.append(child)
+        elif child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+            removed.append(child)
     return removed

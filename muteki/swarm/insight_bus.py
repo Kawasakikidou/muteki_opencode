@@ -46,6 +46,15 @@ class InsightKind(str, Enum):
     #   `text` carries the seconds remaining. NOBODY submits until it elapses.
 
 
+# F14: transient lock signals must NOT replay to late subscribers (a stale lock
+# would "revive" for the original duration). Everything else in history does.
+_TRANSIENT_KINDS = frozenset({
+    InsightKind.SUBMIT_LOCKED,
+    InsightKind.SUBMIT_UNLOCKED,
+    InsightKind.VERIFIER_LOCKED,
+})
+
+
 @dataclass
 class Insight:
     kind: InsightKind
@@ -83,9 +92,14 @@ class InsightBus:
     def subscribe(self, solver_id: str) -> asyncio.Queue[Insight]:
         q: asyncio.Queue[Insight] = asyncio.Queue()
         self._inboxes[solver_id] = q
-        # catch the newcomer up on everything broadcast so far
+        # catch the newcomer up on everything broadcast so far — EXCEPT transient
+        # lock signals (F14): replaying an old SUBMIT_LOCKED / VERIFIER_LOCKED
+        # makes a late worker re-lock a cooldown that has long since ended (the
+        # lock "revives" for the original seconds). Persist-class insights
+        # (facts/dead-ends/guidance/flags) replay; lock signals must be
+        # experienced live or not at all.
         for ins in self.history:
-            if ins.by != solver_id:
+            if ins.by != solver_id and ins.kind not in _TRANSIENT_KINDS:
                 q.put_nowait(ins)
         return q
 

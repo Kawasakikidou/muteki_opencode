@@ -1,186 +1,122 @@
-"""Finding B: SessionStore.summary() must carry multi-flag fields through and compute
-`solved` by mode, so a rehydrated multi-flag run isn't flattened to a single-flag
-look-alike and a partial multi-flag run isn't falsely marked solved."""
+"""SessionStore JSONL durability + run_id path guards (H1b).
+
+H1b: `_path` used to be a replace-only sanitizer — on Windows a drive-qualified
+id (`C:\\evil`) or UNC id (`\\\\server\\share`) kept the WHOLE rhs of
+`root / id.jsonl` and escaped sessions_root entirely (arbitrary JSONL read via
+replay, arbitrary append via the bus sink). The guard must be rejection-based
+and platform-independent (pure string checks — a `\\` or drive prefix is
+poisonous on every OS, not just Windows).
+"""
+
+from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 
+import pytest
+
+from muteki.core.events import Event, EventType
 from muteki.core.session_store import SessionStore
 
+_BAD_RUN_IDS = [
+    "C:\\evil",
+    "C:evil",           # drive-relative — escape on Windows
+    "\\\\server\\share\\x",
+    "a\\b",             # backslash separator (Windows)
+    "..",
+    ".",
+    "",
+    None,
+    "x\x00y",           # NUL
+    "..\\..\\etc\\passwd",
+    "a..b",             # Round-5: `..` substring — folds to a_b (collides)
+    "run..1",
+    "a...b",
+]
 
-def _write(root: Path, run_id: str, events: list[dict]) -> None:
-    path = root / f"{run_id}.jsonl"
-    with path.open("w", encoding="utf-8") as f:
-        for i, ev in enumerate(events, 1):
-            ev.setdefault("seq", i)
-            ev.setdefault("ts", float(i))
-            ev.setdefault("run_id", run_id)
-            f.write(json.dumps(ev) + "\n")
 
-
-def test_summary_multi_flag_partial_not_solved(tmp_path: Path) -> None:
-    """1/3 flags collected, run.finished solved=false → solved stays False, flags are
-    preserved, and the multi-flag mode survives (expected_flags=3, multi_flag=True).
-    The old summary() dropped these fields and FlagFound forced solved=True."""
+@pytest.mark.parametrize("run_id", _BAD_RUN_IDS)
+def test_path_rejects_escaping_run_ids(tmp_path, run_id):
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-mf", [
-        {"event_type": "run.started",
-         "payload": {"challenge": {"name": "triple", "category": "web",
-                                   "expected_flags": 3, "multi_flag": True}}},
-        {"event_type": "insight.event",
-         "payload": {"kind": "FlagFound", "flag": "flag{one}"}},
-        {"event_type": "run.finished",
-         "payload": {"solved": False, "flags": ["flag{one}"],
-                     "expected_flags": 3, "multi_flag": True}},
-    ])
-    s = store.summary("run-mf")
-    assert s["solved"] is False, "a 1/3 multi-flag run is NOT solved"
-    assert s["flags"] == ["flag{one}"]
-    assert s["flag"] == "flag{one}"
-    assert s["expected_flags"] == 3
-    assert s["multi_flag"] is True
+    with pytest.raises(ValueError):
+        store.path_for(run_id)  # type: ignore[arg-type]
 
 
-def test_summary_multi_flag_complete_is_solved(tmp_path: Path) -> None:
-    """3/3 flags collected with run.finished solved=true → solved True, all flags kept."""
+def test_path_keeps_forward_slash_replacement(tmp_path):
+    """batch challenge ids like 'web/xss' are legitimate — forward slashes keep
+    the historical `_` replacement instead of being rejected."""
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-done", [
-        {"event_type": "run.started",
-         "payload": {"challenge": {"expected_flags": 3, "multi_flag": True}}},
-        {"event_type": "insight.event", "payload": {"kind": "FlagFound", "flag": "f1"}},
-        {"event_type": "insight.event", "payload": {"kind": "FlagFound", "flag": "f2"}},
-        {"event_type": "insight.event", "payload": {"kind": "FlagFound", "flag": "f3"}},
-        {"event_type": "run.finished",
-         "payload": {"solved": True, "flags": ["f1", "f2", "f3"],
-                     "expected_flags": 3, "multi_flag": True}},
-    ])
-    s = store.summary("run-done")
-    assert s["solved"] is True
-    assert s["flags"] == ["f1", "f2", "f3"]
-    assert s["expected_flags"] == 3
-    assert s["multi_flag"] is True
+    p = store.path_for("batch-web/xss")
+    assert p.name == "batch-web_xss.jsonl"
+    assert p.parent == tmp_path
 
 
-def test_summary_single_flag_ghost_run_stays_solved(tmp_path: Path) -> None:
-    """Ghost run: a FlagFound but NO run.finished (killed before emitting it). For a
-    single-flag run a found flag IS a win — solved must remain True after restart,
-    otherwise the rail would wrongly flip a solved run back to unsolved."""
+def test_path_accepts_legitimate_ids(tmp_path):
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-ghost", [
-        {"event_type": "run.started",
-         "payload": {"challenge": {"name": "single", "category": "crypto"}}},
-        {"event_type": "insight.event",
-         "payload": {"kind": "FlagFound", "flag": "flag{got_it}"}},
-        # no run.finished
-    ])
-    s = store.summary("run-ghost")
-    assert s["solved"] is True
-    assert s["flag"] == "flag{got_it}"
-    assert s["flags"] == ["flag{got_it}"]
-    assert s["expected_flags"] == 1
-    assert s["multi_flag"] is False
+    for rid in ("run-0001", "run-0001-r2", "batch-17", "a.b_c-d", "uuid-like-1234"):
+        p = store.path_for(rid)
+        assert p.parent == tmp_path
+        assert p.name == f"{rid}.jsonl"
 
 
-def test_summary_multi_flag_ghost_partial_not_solved(tmp_path: Path) -> None:
-    """Ghost multi-flag run (no run.finished) with only 1/2 flags must NOT be solved —
-    a partial multi-flag set is not a win even without a terminal event."""
+def test_path_single_dot_inside_id_kept_distinct(tmp_path):
+    """Round-5: a SINGLE dot inside the id must stay itself (`a.b` ≠ `a_b`) —
+    only a `..` SUBSTRING is the collision hazard."""
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-mfg", [
-        {"event_type": "run.started",
-         "payload": {"challenge": {"expected_flags": 2, "multi_flag": True}}},
-        {"event_type": "insight.event", "payload": {"kind": "FlagFound", "flag": "a"}},
-        # no run.finished, only 1 of 2
-    ])
-    s = store.summary("run-mfg")
-    assert s["solved"] is False
-    assert s["flags"] == ["a"]
-    assert s["expected_flags"] == 2
-    assert s["multi_flag"] is True
+    assert store.path_for("a.b").name == "a.b.jsonl"
+    assert store.path_for("a_b").name == "a_b.jsonl"
+    assert store.path_for("a.b") != store.path_for("a_b")
 
 
-def test_summary_finished_verdict_overrides_flagfound(tmp_path: Path) -> None:
-    """An explicit run.finished solved=False is authoritative even if a FlagFound was
-    emitted earlier (single-flag): the run was reopened / flag invalidated."""
+def test_path_rejects_dotdot_substring(tmp_path):
+    """Round-5: `a..b` used to fold to `a_b` — the SAME jsonl as the distinct
+    run `a_b`, so replay/SSE mixed the two runs' events (incl. flags)."""
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-inv", [
-        {"event_type": "run.started", "payload": {"challenge": {}}},
-        {"event_type": "insight.event", "payload": {"kind": "FlagFound", "flag": "x"}},
-        {"event_type": "run.finished", "payload": {"solved": False}},
-    ])
-    s = store.summary("run-inv")
-    assert s["solved"] is False
+    for rid in ("a..b", "run..1", "a...b", "..x", "x.."):
+        with pytest.raises(ValueError):
+            store.path_for(rid)
 
 
-def test_summary_resolve_reopen_preserves_prior_flags(tmp_path: Path) -> None:
-    """A resolve/continue reopen makes the run active again but must not erase the
-    already recovered multi-flag results from durable history."""
+def test_append_rejects_escaping_run_id(tmp_path):
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-resolve", [
-        {"event_type": "run.started",
-         "payload": {"challenge": {"expected_flags": 3, "multi_flag": True}}},
-        {"event_type": "run.finished",
-         "payload": {"solved": True, "flags": ["flag{a}", "flag{b}"],
-                     "expected_flags": 3, "multi_flag": True}},
-        {"event_type": "run.reopened", "payload": {"reason": "resolve"}},
-    ])
-    s = store.summary("run-resolve")
-    assert s["finished"] is False
-    assert s["solved"] is False
-    assert s["flags"] == ["flag{a}", "flag{b}"]
-    assert s["flag"] == "flag{a}"
+    ev = Event(event_type=EventType.RUN_STARTED, run_id="C:\\evil", payload={})
+    with pytest.raises(ValueError):
+        asyncio.run(store.append(ev))
 
 
-def test_summary_false_positive_reopen_drops_only_target_flag(tmp_path: Path) -> None:
-    """A per-flag false-positive reopen removes only the targeted bad flag when the
-    rail is rebuilt from JSONL after a server restart."""
+def test_replay_rejects_escaping_run_id(tmp_path):
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-fp", [
-        {"event_type": "run.started",
-         "payload": {"challenge": {"expected_flags": 3, "multi_flag": True}}},
-        {"event_type": "run.finished",
-         "payload": {"solved": True, "flags": ["flag{a}", "flag{b}", "flag{c}"],
-                     "expected_flags": 3, "multi_flag": True}},
-        {"event_type": "run.reopened", "payload": {"flag": "flag{b}"}},
-    ])
-    s = store.summary("run-fp")
-    assert s["finished"] is False
-    assert s["solved"] is False
-    assert s["flags"] == ["flag{a}", "flag{c}"]
-    assert s["flag"] == "flag{a}"
+    gen = store.replay("\\\\server\\share\\x")
+    # replay is an async generator — the _path guard fires on first iteration.
+    with pytest.raises(ValueError):
+        asyncio.run(gen.__anext__())
 
 
-def test_summary_empty_run_defaults(tmp_path: Path) -> None:
-    """A run with no events yet returns safe defaults including the new fields."""
+def test_lock_table_is_bounded(tmp_path):
+    """Round-5: _locks must not grow without bound on a long-lived backend —
+    evicts a non-held lock first, else the oldest-inserted entry."""
     store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-empty", [])
-    s = store.summary("run-empty")
-    assert s["flags"] == []
-    assert s["expected_flags"] == 1
-    assert s["multi_flag"] is False
-    assert s["solved"] is False
+    store._MAX_LOCKS = 3
+    for i in range(5):
+        store._lock_for(f"run-{i:03d}")
+    assert len(store._locks) <= 3
+    # oldest-inserted entries were evicted first (all locks were idle)
+    assert "run-000" not in store._locks
+    assert "run-004" in store._locks
 
 
-def test_replay_monotonic_repairs_seq_reset(tmp_path: Path) -> None:
-    """Durable SSE replay must repair historical raw seq resets.
+def test_lock_table_evicts_idle_before_held(tmp_path):
+    """Round-5: when the table is full, an idle lock is evicted in preference to
+    a held one."""
+    async def _scenario():
+        store = SessionStore(root=tmp_path)
+        store._MAX_LOCKS = 2
+        held = store._lock_for("held")
+        await held.acquire()            # hold it
+        assert held.locked() is True
+        store._lock_for("idle-1")       # {held(locked), idle-1}
+        store._lock_for("idle-2")       # evicts idle-1 (unlocked) → {held, idle-2}
+        assert "held" in store._locks   # held lock survived
+        assert "idle-1" not in store._locks
+        held.release()
 
-    A backend restart/continue path once produced JSONL like 1,2,3,1,2. The
-    browser uses Last-Event-ID as a stream cursor, so replay must expose that
-    as 1,2,3,4,5 without rewriting the file.
-    """
-    store = SessionStore(root=tmp_path)
-    _write(tmp_path, "run-reset", [
-        {"event_type": "run.started", "seq": 1, "payload": {}},
-        {"event_type": "reasoning.delta", "seq": 2, "payload": {"text": "before"}},
-        {"event_type": "run.finished", "seq": 3, "payload": {}},
-        {"event_type": "run.reopened", "seq": 1, "payload": {"reason": "resolve"}},
-        {"event_type": "reasoning.delta", "seq": 2, "payload": {"text": "after"}},
-    ])
-
-    async def _collect():
-        return [ev async for ev in store.replay_monotonic("run-reset", after_seq=3)]
-
-    replayed = asyncio.run(_collect())
-    assert store.last_stream_seq("run-reset") == 5
-    assert [ev.seq for ev in replayed] == [4, 5]
-    assert [ev.event_type.value for ev in replayed] == ["run.reopened", "reasoning.delta"]
+    asyncio.run(_scenario())

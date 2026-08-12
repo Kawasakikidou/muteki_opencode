@@ -14,22 +14,17 @@ from muteki.models.solve_graph import SolveGraph
 
 @dataclass
 class SolverConfig:
-    max_steps: int = 12
-    code_timeout: float = 90.0
-    temperature: float = 0.4
-    max_tokens: int = 8000
-    stdout_limit: int = 6000  # chars of stdout shown inline before overflow->artifact
-    # P-C: auto-trigger the Reason phase (planner + evidence audit) when the
-    # shared graph's fact/dead-end count grows. Off when there's no shared graph
-    # (solo solver) — it only adds value with a shared, gated graph to plan over.
-    reason_enabled: bool = True
-    reason_model: str = ""  # empty → reuse the solver's own model (a cheap one is fine)
-    reason_max_intents: int = 4
-    # Watchdog: if this many consecutive reason cycles produce NO new verified fact,
-    # the run is spinning — force the conclude turn early instead of burning the
-    # whole step budget. 0 disables the watchdog. (Convergence guard: stop
-    # re-planning a stuck run; don't wait for max_steps.)
-    stale_reason_limit: int = 3
+    """Vestigial config object — kept only as a call-site placeholder.
+
+    The code-driven solver that consumed these fields is gone; the CLI executor
+    and swarm take their knobs (timeouts, budgets, engine roster, …) directly
+    via constructor args. All fields that were zero-reference in production
+    (code_timeout/temperature/max_tokens/stdout_limit/reason_*) were deleted
+    (run-fix); this empty shell stays so existing `config=SolverConfig()`
+    call sites keep compiling. Do not add new knobs here — add them to Swarm /
+    CliSolver constructors.
+    """
+    pass
 
 
 @dataclass

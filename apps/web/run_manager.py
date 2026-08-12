@@ -31,6 +31,24 @@ from muteki.core.session_store import SessionStore
 
 LOG = logging.getLogger(__name__)
 
+# run-fix (H1): run_id arrives from URL path segments — `.` / `..` / `` /
+# separator-laden values must NEVER reach disk paths. `DELETE /api/runs/.`
+# used to resolve to `sessions_root / "."` and rmtree the ENTIRE sessions
+# tree (JSONL + workspaces + shared_graph.db + _secrets). Whitelist.
+# Round-5: `(?!.*\.\.)` rejects any `..` SUBSTRING too — without it `a..b`
+# passed the whitelist but SessionStore._path folded it to `a_b`, so two
+# DISTINCT run ids (`a..b` / `a_b`) landed on the SAME jsonl file and their
+# event streams (incl. flag events) cross-contaminated via replay/SSE.
+_RUN_ID_SAFE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _safe_run_id(run_id: str) -> str:
+    """Reject path-traversal run ids. Raises ValueError — callers translate to
+    400 / skip, NEVER fall through to a filesystem path."""
+    if not _RUN_ID_SAFE.match(str(run_id or "")):
+        raise ValueError(f"invalid run_id: {run_id!r}")
+    return str(run_id)
+
 
 @dataclass
 class Run:
@@ -47,6 +65,10 @@ class Run:
     # — one at a time per run.
     standby_task: Optional[asyncio.Task] = None
     finished: bool = False
+    # M4: the operator asked to stop this run — a backstop task.cancel() after
+    # the graceful window must synthesize RUN_FINISHED as "operator_stop", not
+    # mislabel an operator action as a runtime crash.
+    operator_stop: bool = False
     flag: Optional[str] = None
     # multi-flag: every distinct flag the run collected (dedup, discovery order).
     # `flag` stays the first for back-compat. expected_flags drives the rail/UI
@@ -355,6 +377,10 @@ class RunManager:
 
     async def delete(self, run_id: str) -> bool:
         """Hard-delete a run: cancel its task(s), drop the handle + JSONL + meta."""
+        try:
+            _safe_run_id(run_id)
+        except ValueError:
+            return False  # traversal attempt — never touch disk
         run = self.runs.pop(run_id, None)
         if run is None:
             # still scrub any orphaned on-disk artifacts / meta
@@ -377,8 +403,8 @@ class RunManager:
         return True
 
     def _delete_artifacts(self, run_id: str) -> None:
-        self.meta.forget(run_id)
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = _safe_run_id(run_id)  # H1: '.' / '..' / '' raise — no rmtree of root
+        self.meta.forget(safe)
         jsonl = self.sessions_root / f"{safe}.jsonl"
         try:
             jsonl.unlink(missing_ok=True)
@@ -448,7 +474,7 @@ class RunManager:
         Replaces the old tempfile.mkdtemp root so sandbox, artifacts, and
         shared_graph.db survive process restarts. Same id-sanitization as
         uploads_dir / _delete_artifacts."""
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = _safe_run_id(run_id)  # H1: reject traversal ids at every disk touch
         d = self.sessions_root / safe / "workspace"
         d.mkdir(parents=True, exist_ok=True)
         return d
@@ -484,7 +510,7 @@ class RunManager:
         is a sibling of the run's {id}.jsonl log — SessionStore only globs
         *.jsonl, so a directory of the same stem never collides with rehydration.
         """
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = _safe_run_id(run_id)  # H1: reject traversal ids at every disk touch
         d = self.sessions_root / safe / "uploads"
         d.mkdir(parents=True, exist_ok=True)
         return d
@@ -612,6 +638,18 @@ class RunManager:
     async def start(self, run_id: str, driver: Driver) -> Run:
         """Create the run and launch `driver` as a background task on its bus."""
         run = self.create(run_id)
+        # H2: a FINISHED run's bus is closed — restarting on the old bus silently
+        # kills fan-out (the deck's SSE spins forever, no live events) while the
+        # new swarm burns tokens in the dark. Swap to a fresh live bus first.
+        # (_fresh_bus is a no-op when the bus is still open, so a live run is
+        # unaffected.)
+        self._fresh_bus(run)
+        if run.task is not None and not run.task.done():
+            # double /start (double-click, client retry) must NOT overwrite the
+            # live task reference — that used to orphan the running swarm (no way
+            # to cancel it) AND launch a second one on the same workspace
+            # (interleaved events, double spend). Idempotent: return the run.
+            return run
 
         async def _go() -> None:
             failure_detail = ""
@@ -634,7 +672,8 @@ class RunManager:
                                      "expected_flags": run.expected_flags,
                                      "multi_flag": run.multi_flag,
                                      "solved": run.solved,
-                                     "reason": "runtime_failure",
+                                     "reason": ("operator_stop" if run.operator_stop
+                                                else "runtime_failure"),
                                      "detail": failure_detail}))
                     except Exception:
                         pass
@@ -688,6 +727,9 @@ class RunManager:
                     if run.task.done():
                         break
                 if not run.task.done():
+                    # M4: remember the operator's intent so the backstop cancel's
+                    # synthesized RUN_FINISHED says "operator_stop", not a crash.
+                    run.operator_stop = True
                     run.task.cancel()
             else:
                 # ghost / already-dead task → settle the state ourselves.
@@ -733,7 +775,18 @@ class RunManager:
         else:
             delivery = "no_live_workers"
 
-        await run.hitl.put({"target": target, "action": action, **fields})
+        # Only a LIVE run has a consumer for run.hitl (the swarm's _drain_hitl).
+        # A finished run routes to a standby worker via hitl_cmd injection — putting
+        # the command into the queue there would drop it into a dead queue nobody
+        # drains (L7: operator saw "delivered", the command vanished).
+        if live:
+            await run.hitl.put({"target": target, "action": action, **fields})
+        elif action in self._STANDBY_ACTIONS:
+            # M5: start the standby FIRST — _ensure_standby swaps in a fresh bus for
+            # a finished run — so the echo below lands on the bus the deck is
+            # actually subscribed to, not the closed one (previously the operator's
+            # own command confirmation never arrived until a page refresh).
+            self._ensure_standby(run_id, {"target": target, "action": action, **fields})
         await run.bus.emit(
             Event(
                 event_type=EventType.HITL_RESPONSE,
@@ -741,8 +794,6 @@ class RunManager:
                 payload=hitl_response_payload(target, action, delivery=delivery, **fields),
             )
         )
-        if not live and action in self._STANDBY_ACTIONS:
-            self._ensure_standby(run_id, {"target": target, "action": action, **fields})
         return True
 
     async def post_worker_cmd(self, run_id: str, action: str, *,
@@ -830,9 +881,29 @@ class RunManager:
         driver = build_driver(merged, mgr=self)
 
         async def _go() -> None:
+            failure_detail = ""
             try:
                 await driver(run)
+            except Exception as exc:
+                failure_detail = str(exc)[:500]
             finally:
+                # M1: a crashed/errored resolve swarm must still synthesize the
+                # terminal event (mirrors start()'s _go) — otherwise the deck stays
+                # on a permanent "running" spinner with no terminal event to
+                # trigger reconnect, even though the rail says finished.
+                if not run.finished:
+                    try:
+                        await run.bus.emit(Event(
+                            event_type=EventType.RUN_FINISHED, run_id=run_id,
+                            payload={"flag": run.flag, "flags": list(run.flags),
+                                     "expected_flags": run.expected_flags,
+                                     "multi_flag": run.multi_flag,
+                                     "solved": run.solved,
+                                     "reason": ("operator_stop" if run.operator_stop
+                                                else "runtime_failure"),
+                                     "detail": failure_detail}))
+                    except Exception:
+                        pass
                 run.finished = True
                 await run.bus.close()
 

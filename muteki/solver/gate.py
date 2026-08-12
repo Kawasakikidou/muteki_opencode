@@ -15,7 +15,26 @@ borrowing the other's method.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Any
+
+
+@lru_cache(maxsize=32)
+def _compile_flag_format(fmt: str):
+    """Compile an operator-supplied flag_format regex, tolerating typos.
+
+    flag_format is free-form operator input; an unescaped `{` / `(` etc. would
+    raise re.error and blow up the whole acceptance path (gate must never
+    crash — a broken format falls back to the token strength floor, which is
+    strictly STRICTER than a loose brace regex, so this cannot weaken the gate).
+
+    lru_cache: flag_ok() compiles the format once PER CANDIDATE FLAG — a run
+    that gates hundreds of flags re-compiled the same regex every time.
+    """
+    try:
+        return re.compile(fmt)
+    except re.error:
+        return None
 
 
 def referenced_artifacts(text: str) -> list[str]:
@@ -181,8 +200,16 @@ def flag_ok(flag: str, raw_output: str, *, flag_format: str, artifacts: Any) -> 
     if flag_format == TOKEN_FLAG_FORMAT:
         if not _looks_like_real_token(flag):
             return False
-    elif not re.search(flag_format, flag):
-        return False
+    elif not flag_format:
+        pass  # 原行为:空格式 = 格式不约束(恒匹配),占位符+出处仍生效
+    else:
+        fmt_re = _compile_flag_format(flag_format)
+        if fmt_re is None:
+            # broken regex → token strength floor, never crash the gate
+            if not _looks_like_real_token(flag):
+                return False
+        elif not fmt_re.search(flag):
+            return False
     if is_placeholder_flag(flag):
         return False
     if flag in raw_output:

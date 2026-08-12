@@ -48,7 +48,7 @@ from apps.web.auth import (
     issue_token,
     verify_token,
 )
-from apps.web.run_manager import Run, RunManager
+from apps.web.run_manager import Run, RunManager, _safe_run_id
 from muteki.core.dotenv_boot import load_env
 from muteki.core.events import Event, EventType
 from muteki.solver.credential_accounts import (
@@ -107,6 +107,17 @@ async def _require_dict_body(request: "Request", *, allow_empty: bool = False) -
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="request body must be a JSON object")
     return body
+
+
+def _guard_run_id(run_id: str) -> str:
+    """H1: every {run_id} route rejects traversal ids BEFORE any manager/disk
+    touch — '.'/'..' used to rmtree the whole sessions dir, and a Windows
+    drive-qualified id (C:\\…, \\\\server\\share) escaped SessionStore paths
+    entirely. Surface a clean 400 instead of a later 500."""
+    try:
+        return _safe_run_id(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid run_id")
 
 
 def create_app(manager: Optional[RunManager] = None) -> FastAPI:
@@ -231,9 +242,21 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         body = await _require_dict_body(request, allow_empty=True)
         if not cfg.enabled:
             return {"ok": True, "token": "", "auth_required": False}
+        # M2: rate-limit the password oracle — when bound to a non-loopback
+        # host, the password is the ONLY gate in front of full API power
+        # (credential read/write, run control, container probes). No lockout
+        # meant unlimited remote brute-force.
+        limiter: LoginThrottle = getattr(app.state, "login_throttle", None)
+        if limiter is None:
+            limiter = LoginThrottle()
+            app.state.login_throttle = limiter  # type: ignore[attr-defined]
+        client_ip = request.client.host if request.client else "?"
+        limiter.check(client_ip)
         if not check_password(cfg, body.get("password")):
+            limiter.fail(client_ip)
             # constant-time compare already done; uniform 401, no "wrong length"
             raise HTTPException(status_code=401, detail="invalid password")
+        limiter.ok(client_ip)
         return {"ok": True, "token": issue_token(cfg), "auth_required": True}
 
     @app.get("/api/auth/me")
@@ -267,6 +290,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # Operator rail mutations: pin / archive / rename. Body carries any of
         # {"pinned": bool, "archived": bool, "name": str}. Each is persisted to
         # the meta side-table and reflected in subsequent /api/runs summaries.
+        run_id = _guard_run_id(run_id)
         body = await _require_dict_body(request)
         mgr = app.state.manager
         ok = True
@@ -309,6 +333,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def delete_run(run_id: str) -> Any:
         # Hard-delete: cancels the task, drops the in-memory handle, the JSONL
         # log, and the meta row. Irreversible — the UI confirms before calling.
+        # H1: reject traversal ids at the route layer (double guard with
+        # manager.delete — a '.' would previously rmtree the whole sessions dir).
+        run_id = _guard_run_id(run_id)
         ok = await app.state.manager.delete(run_id)
         return {"ok": ok}
 
@@ -316,6 +343,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     async def open_run_workspace(run_id: str) -> Any:
         # Reveal the run's workspace dir in the host file manager. Only meaningful
         # when the operator runs the backend locally; a no-op (ok:false) otherwise.
+        # H1: a traversal run_id used to reach workspace_dir() → ValueError 500;
+        # reject at the route layer like delete_run.
+        run_id = _guard_run_id(run_id)
         ok = app.state.manager.open_workspace(run_id)
         return {"ok": ok}
 
@@ -325,6 +355,9 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         from muteki.swarm.shared_graph import SQLiteSharedGraph
 
         mgr: RunManager = app.state.manager
+        # H1: same route-layer guard — workspace_dir() raises ValueError on a
+        # traversal id; surface a clean 400 instead of a 500.
+        run_id = _guard_run_id(run_id)
         run = mgr.get(run_id)
         graph_db = mgr.workspace_dir(run_id) / "graph" / "shared_graph.db"
         if not graph_db.exists():
@@ -372,6 +405,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         from muteki.solver.worker_profiles import base_engine_for_profile
 
         body = await _require_dict_body(request)
+        run_id = _guard_run_id(run_id)  # H1: traversal ids never touch disk paths
         question = str(body.get("question") or "").strip()
         if not question:
             return JSONResponse({"error": "empty question"}, status_code=400)
@@ -386,7 +420,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
         # The worker needs a cwd, so /btw creates only a per-turn scratch dir under
         # the run workspace. It never opens the graph read-write or joins the swarm.
-        safe = run_id.replace("/", "_").replace("..", "_")
+        safe = _safe_run_id(run_id)
         root = mgr.workspace_dir(run_id).resolve()
         graph_db = root / "graph" / "shared_graph.db"
         jsonl_path = (mgr.sessions_root / f"{safe}.jsonl").resolve()
@@ -928,6 +962,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     @app.post("/api/runs/{run_id}/start")
     async def start_run(run_id: str, request: Request) -> Any:
+        run_id = _guard_run_id(run_id)
         body = await _require_dict_body(request)
         from apps.web.drivers import build_driver
 
@@ -982,6 +1017,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # threads those paths into challenge.attachments at /start, and the
         # worker stages them into its cwd (CliSolver._stage_attachments). No
         # bytes flow through /start — only the saved paths.
+        run_id = _guard_run_id(run_id)
         mgr: RunManager = app.state.manager
         # ensure a run handle exists so an upload BEFORE dispatch still works
         # (the deck promotes a draft to a real run id before uploading, but be
@@ -1046,6 +1082,10 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             if not authed:
                 raise HTTPException(status_code=401, detail="unauthorized")
         manager: RunManager = app.state.manager
+        # H1: reject traversal ids BEFORE create() — a drive-qualified id used to
+        # reach SessionStore._path and escape sessions_root; create() also spams a
+        # hostile handle into self.runs.
+        run_id = _guard_run_id(run_id)
         # A deck commonly opens its event stream BEFORE the run is launched (the
         # operator stares at an empty board, then fills the form). Create the run
         # handle on demand so the SSE stays open and starts streaming the instant
@@ -1126,6 +1166,11 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
                 while run.bus is bus:
                     if await request.is_disconnected():
                         return
+                    # M3: the run was DELETE'd — its handle is gone from the
+                    # manager and nothing will ever close this bus's stream.
+                    # End the SSE instead of spinning forever on a dead run.
+                    if app.state.manager.get(run_id) is not run:
+                        return
                     await asyncio.sleep(1)
 
         return EventSourceResponse(
@@ -1147,6 +1192,12 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
             if not authed:
                 await ws.close(code=4401)
                 return
+        # H1: WS can't raise HTTPException — close the handshake instead.
+        try:
+            _safe_run_id(run_id)
+        except ValueError:
+            await ws.close(code=4004)
+            return
         await ws.accept()
         manager: RunManager = app.state.manager
         run = manager.get(run_id)
@@ -1169,6 +1220,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         """"继续做题": relaunch the full coordinator swarm on a finished run (reuses
         its workspace so verified facts carry over). Distinct from /hitl which, on a
         finished run, only cold-starts a single standby worker for a follow-up."""
+        run_id = _guard_run_id(run_id)
         body = await _require_dict_body(request, allow_empty=True)
         ok = await app.state.manager.resolve(run_id, body)
         return {"ok": ok}
@@ -1178,6 +1230,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
         # operator runtime control: add a worker for a specific engine to a LIVE
         # coordinator run. Body {"engine": "cursor"|"claude"|"codex"} (optional —
         # omitted lets the coordinator pick a heterogeneity-aware engine).
+        run_id = _guard_run_id(run_id)
         body = await _require_dict_body(request, allow_empty=True)
         ok = await app.state.manager.post_worker_cmd(
             run_id, "spawn", engine=body.get("engine"))
@@ -1186,6 +1239,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
     @app.delete("/api/runs/{run_id}/workers")
     async def kill_worker(run_id: str, request: Request) -> Any:
         # operator runtime control: stop a specific worker by its solver_id.
+        run_id = _guard_run_id(run_id)
         body = await _require_dict_body(request, allow_empty=True)
         ok = await app.state.manager.post_worker_cmd(
             run_id, "kill", solver_id=body.get("solver_id"))
@@ -1193,6 +1247,7 @@ def create_app(manager: Optional[RunManager] = None) -> FastAPI:
 
     @app.post("/api/runs/{run_id}/hitl")
     async def hitl(run_id: str, request: Request) -> Any:
+        run_id = _guard_run_id(run_id)
         body = await _require_dict_body(request)
         ok = await app.state.manager.post_hitl(
             run_id,

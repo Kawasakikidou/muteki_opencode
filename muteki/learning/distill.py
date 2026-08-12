@@ -38,6 +38,9 @@ _STOP = {
 
 
 def _keywords(text: str, k: int = 12) -> list[str]:
+    # F31: latin tokens ONLY left CJK challenge descriptions with an EMPTY
+    # fingerprint — templates for Chinese-named challenges were never recallable.
+    # Add CJK unigram + bigram coverage alongside the latin tokens.
     toks = re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", text.lower())
     seen: list[str] = []
     for t in toks:
@@ -45,7 +48,21 @@ def _keywords(text: str, k: int = 12) -> list[str]:
             continue
         seen.append(t)
         if len(seen) >= k:
-            break
+            return seen
+    # CJK fallback fills the rest of the window (ranked: bigrams then unigrams).
+    han = re.findall(r"[\u4e00-\u9fff]", text)
+    if han:
+        bigrams = ["".join(han[i:i + 2]) for i in range(len(han) - 1)]
+        for b in bigrams:
+            if b not in seen:
+                seen.append(b)
+                if len(seen) >= k:
+                    return seen
+        for u in han:
+            if u not in seen:
+                seen.append(u)
+                if len(seen) >= k:
+                    break
     return seen
 
 
@@ -89,6 +106,11 @@ class Template:
     @classmethod
     def from_yaml(cls, text: str) -> "Template":
         d = yaml.safe_load(text) or {}
+        chains: dict[str, list[str]] = {}
+        for k, v in ((d.get("flag_evidence_chains") or {}).items()):
+            # F34: a string value used to be list()-splatted into characters
+            # ("abc" → ["a","b","c"]) — silently corrupt data. Coerce properly.
+            chains[str(k)] = v if isinstance(v, list) else [str(v)]
         return cls(
             name=d.get("name", ""),
             category=d.get("category", "misc"),
@@ -98,9 +120,7 @@ class Template:
             source=d.get("source", ""),
             notes=d.get("notes", ""),
             evidence_chain=list(d.get("evidence_chain", [])),
-            flag_evidence_chains={
-                str(k): list(v) for k, v in (d.get("flag_evidence_chains") or {}).items()
-            },
+            flag_evidence_chains=chains,
         )
 
 
@@ -120,6 +140,10 @@ def distill(graph: SolveGraph, *, winner: Optional[str] = None,
     # category signal words bias the fingerprint
     steps: list[str] = []
     confirmed = [h for h in graph.hypotheses if h.status is HypothesisStatus.CONFIRMED]
+    # F32: hypothesis STATEMENTS also need flag sanitization — they can carry the
+    # recovered flag ("submitted flag{...} → 200 OK"); leaking it into the shared
+    # cross-run YAML knowledge base violated the module's "never store the flag"
+    # contract. Sanitize happens below against all_flags, so collect raw first.
     for h in confirmed:
         steps.append(h.statement.strip())
     # add the evidence trail (objective facts), minus anything containing a flag.
@@ -133,6 +157,10 @@ def distill(graph: SolveGraph, *, winner: Optional[str] = None,
                 fact = fact.replace(fl, "<FLAG>")
         return fact
 
+    # F32: hypothesis statements collected above must go through the SAME
+    # sanitizer as evidence — a confirmed-hypothesis sentence that quotes the
+    # flag used to leak it straight into the shared YAML knowledge base.
+    steps = [_sanitize(s) for s in steps]
     for ev in graph.evidence:
         fact = _sanitize(ev.fact.strip())
         if fact and fact not in steps:

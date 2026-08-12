@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
@@ -26,6 +27,8 @@ import httpx
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
 from muteki.core.events import Event, EventType
+
+_LOG = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = os.environ.get("MUTEKI_DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
@@ -147,15 +150,24 @@ class LLMClient:
             )
 
     async def _record_cost(self, model, usage, run_id, challenge_id, solver_id):
-        if self.cost is not None and run_id is not None and usage:
-            await self.cost.record(
-                model=model,
-                input_tokens=usage.get("prompt_tokens", 0),
-                output_tokens=usage.get("completion_tokens", 0),
-                run_id=run_id,
-                challenge_id=challenge_id,
-                solver_id=solver_id,
-            )
+        if self.cost is not None and run_id is not None:
+            if usage:
+                await self.cost.record(
+                    model=model,
+                    input_tokens=usage.get("prompt_tokens", 0),
+                    output_tokens=usage.get("completion_tokens", 0),
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    solver_id=solver_id,
+                )
+            else:
+                # F1: a streamed response WITHOUT usage (endpoint didn't include
+                # it, or the last chunk carried none) silently zeroes the cost
+                # ledger — the North Star / budget accounting just vanishes with
+                # no trace. Warn loudly instead of silently skipping.
+                _LOG.warning(
+                    "usage missing for model=%s run=%s — stream cost NOT recorded",
+                    model, run_id)
 
     async def chat(
         self,
@@ -176,6 +188,11 @@ class LLMClient:
             "temperature": temperature,
             "stream": stream,
         }
+        # F1: request per-chunk usage in stream mode. OpenAI-compatible endpoints
+        # omit usage from stream chunks by default; without this every default
+        # streamed call recorded ZERO cost.
+        if stream:
+            body["stream_options"] = {"include_usage": True}
         # max_tokens=None → omit the cap entirely (let the API use the model's own
         # maximum). Critical for reasoning models (deepseek-v4-pro): tokens go to
         # reasoning_content FIRST, so a small cap can be fully consumed by thinking
@@ -186,8 +203,13 @@ class LLMClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
+        # shared mutable state so the timeout path below can ESTIMATE the tokens a
+        # cancelled stream already consumed (F1: without this, a timed-out call's
+        # cost vanished from the ledger entirely).
+        stream_state: dict[str, Any] = {"chars": 0}
         coro = (
-            self._chat_stream(body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id)
+            self._chat_stream(body, run_id=run_id, challenge_id=challenge_id,
+                              solver_id=solver_id, stream_state=stream_state)
             if stream
             else self._chat_once(body, run_id=run_id, challenge_id=challenge_id, solver_id=solver_id)
         )
@@ -197,6 +219,18 @@ class LLMClient:
         try:
             resp = await asyncio.wait_for(coro, timeout=self.overall_timeout)
         except asyncio.TimeoutError:
+            if stream and stream_state.get("chars") and self.cost is not None and run_id is not None:
+                try:
+                    est_in = sum(len(str(m.get("content") or "")) for m in messages) // 4
+                    est_out = int(stream_state["chars"]) // 4
+                    await self.cost.record(
+                        model=body["model"],
+                        input_tokens=max(1, est_in),
+                        output_tokens=max(1, est_out),
+                        run_id=run_id, challenge_id=challenge_id, solver_id=solver_id,
+                    )
+                except Exception:
+                    _LOG.exception("estimated cost record failed after timeout")
             return LLMResponse(
                 content="", reasoning="", tool_calls=[],
                 finish_reason="timeout", model=body["model"],
@@ -212,7 +246,14 @@ class LLMClient:
         )
         _raise_for_status(r)
         data = r.json()
-        choice = data["choices"][0]
+        choices = data.get("choices") or []
+        if not choices:
+            # F2: content-filtered / malformed responses return an empty
+            # choices list — degrade to an empty turn instead of IndexError.
+            _LOG.warning("chat returned empty choices (model=%s)", body.get("model"))
+            return LLMResponse(content="", reasoning="", tool_calls=[],
+                               finish_reason="empty", model=body["model"])
+        choice = choices[0]
         msg = choice["message"]
         usage = data.get("usage", {})
         await self._record_cost(body["model"], usage, run_id, challenge_id, solver_id)
@@ -245,7 +286,8 @@ class LLMClient:
             model=body["model"],
         )
 
-    async def _chat_stream(self, body, *, run_id, challenge_id, solver_id) -> LLMResponse:
+    async def _chat_stream(self, body, *, run_id, challenge_id, solver_id,
+                           stream_state: Optional[dict[str, Any]] = None) -> LLMResponse:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         # tool calls reassembled by index
@@ -282,6 +324,8 @@ class LLMClient:
                 rc = delta.get("reasoning_content")
                 if rc:
                     reasoning_parts.append(rc)
+                    if stream_state is not None:
+                        stream_state["chars"] = stream_state.get("chars", 0) + len(rc)
                     await self._emit(
                         EventType.REASONING_DELTA,
                         run_id=run_id, challenge_id=challenge_id, solver_id=solver_id, text=rc,
@@ -289,6 +333,8 @@ class LLMClient:
                 cc = delta.get("content")
                 if cc:
                     content_parts.append(cc)
+                    if stream_state is not None:
+                        stream_state["chars"] = stream_state.get("chars", 0) + len(cc)
                     await self._emit(
                         EventType.TEXT_MESSAGE_DELTA,
                         run_id=run_id, challenge_id=challenge_id, solver_id=solver_id, text=cc,

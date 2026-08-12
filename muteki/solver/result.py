@@ -17,6 +17,19 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+# F27: only canonical 12-hex artifact ids are addressable (see ArtifactStore._find).
+_ARTIFACT_ID = re.compile(r"^[0-9a-f]{12}$")
+
+# Round-5: refuse regexes with the classic exponential-backtracking shape —
+# (a) a group containing a quantifier, itself quantified ((a+)+, (\w+\s*)+),
+# or (b) an alternation followed by an unbounded quantifier ((a|ab)+$ — the
+# textbook ReDoS). Best-effort heuristic, not a proof; the 64 KiB line cap
+# below bounds whatever slips past it.
+_LOOKS_CATASTROPHIC = re.compile(
+    r"\(\s*(?:[^()]*[*+{][^()]*)\s*\)\s*[*+{]"
+    r"|\(\s*[^()]*\|\s*[^()]*\)\s*[+*]",
+    re.IGNORECASE)
+
 
 class ArtifactStore:
     """Disk-backed raw-output store. One file per artifact id."""
@@ -35,6 +48,12 @@ class ArtifactStore:
         return aid
 
     def _find(self, artifact_id: str) -> Optional[Path]:
+        # F27: artifact_id used to be spliced straight into a glob — a caller
+        # (peek is exposed as a model-facing tool) could pass `../../shared_graph.db`
+        # or `*` and read files OUTSIDE the store root. Only canonical 12-hex ids
+        # are addressable now; anything else is "not found".
+        if not isinstance(artifact_id, str) or not _ARTIFACT_ID.fullmatch(artifact_id):
+            return None
         matches = list(self.root.glob(f"{artifact_id}*"))
         return matches[0] if matches else None
 
@@ -79,8 +98,32 @@ def peek(
     total = len(all_lines)
 
     if query:
-        pat = re.compile(query, re.IGNORECASE)
-        hit = next((i for i, ln in enumerate(all_lines) if pat.search(ln)), None)
+        # F28: query is MODEL-CONTROLLED — an invalid regex used to raise and a
+        # pathological one ((a+)+$ on a huge artifact) could hang the worker for
+        # minutes (catastrophic backtracking). Compile defensively and cap size.
+        # Round-5: the length cap does NOT stop ReDoS — `(a+)+$` is 6 chars —
+        # so also refuse nested-quantifier patterns and skip absurdly long lines.
+        query = str(query)[:200]
+        if _LOOKS_CATASTROPHIC.match(query):
+            # A nested repetition ((a+)+, (\w+\s*)+, (a|ab)*+) is the classic
+            # exponential-time shape. Refuse it outright — matched=False reads
+            # exactly like "no match found" to the caller.
+            return PeekResult(artifact_id=artifact_id, found=True,
+                              total_lines=total, matched=False)
+        try:
+            pat = re.compile(query, re.IGNORECASE)
+        except re.error:
+            return PeekResult(artifact_id=artifact_id, found=True,
+                              total_lines=total, matched=False)
+        # Guard the search itself: an unbounded `.*`/`\s*` scan on a huge line
+        # is still quadratic even without nesting. Skip matching lines longer
+        # than 64 KiB — content that big cannot be usefully shown in a peek.
+        MAX_MATCH_LINE = 64 * 1024
+        hit = next(
+            (i for i, ln in enumerate(all_lines)
+             if len(ln) <= MAX_MATCH_LINE and pat.search(ln)),
+            None,
+        )
         if hit is None:
             return PeekResult(
                 artifact_id=artifact_id, found=True, total_lines=total, matched=False

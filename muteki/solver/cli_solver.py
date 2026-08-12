@@ -18,8 +18,10 @@ workdir; for a service challenge the agent only needs the target URL.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -30,6 +32,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from muteki.core.cost import CostController
 from muteki.core.event_bus import EventBus
@@ -57,11 +61,13 @@ from muteki.solver.result_codes import (
 from muteki.solver.types import SolverConfig, SolveOutcome
 from muteki.solver.workspace import (
     ensure_workspace,
+    is_clean_name,
     link_input_into_worker,
     link_shared_into_worker,
     materialize_input,
     materialize_shared_artifact,
     relative_symlink,
+    resolve_inside,
     workspace_root_for_worker,
 )
 
@@ -420,7 +426,10 @@ _REVIEW_PROMPT = (
 # to `flag{H1570rY` → never closed → never registered, despite the worker solving.)
 _FLAG_LINE = re.compile(r"FOUND_FLAG=\s*(.+)")
 # A xxx{...} brace-structured flag anywhere in the captured tail — inner spaces OK.
-_BRACE_FLAG = re.compile(r"[A-Za-z0-9_]{0,15}\{[^}]{1,200}\}")
+# Body cap raised 200 → 512 (run-fix): a legitimate flag body longer than 200
+# chars (long tokens, multi-value flags) was truncated → never registered despite
+# a real solve. 512 comfortably exceeds every CTF/range flag seen in history.
+_BRACE_FLAG = re.compile(r"[A-Za-z0-9_]{0,15}\{[^}]{1,512}\}")
 
 
 def _clean_flag_token(raw: str) -> str:
@@ -1340,10 +1349,25 @@ class CliSolver:
             return res
 
         loop = asyncio.get_running_loop()
+        # run-fix: keep every step future + a done-callback that READS its
+        # result. The old code fired run_coroutine_threadsafe and dropped the
+        # future — an exception inside _emit_step produced a "Task exception was
+        # never retrieved" with the event silently lost. The callback also prunes
+        # the set, so it never grows unbounded.
+        _pending_steps: "set[concurrent.futures.Future]" = set()
+
+        def _on_step_done(fut: "concurrent.futures.Future") -> None:
+            _pending_steps.discard(fut)
+            try:
+                fut.result()
+            except Exception:  # noqa: BLE001 — must not kill the worker thread
+                logger.exception("step emit to loop failed (event lost)")
 
         def on_step(step: StreamStep) -> None:
             # called from the worker thread — hop back to the loop to emit.
-            asyncio.run_coroutine_threadsafe(self._emit_step(step), loop)
+            fut = asyncio.run_coroutine_threadsafe(self._emit_step(step), loop)
+            _pending_steps.add(fut)
+            fut.add_done_callback(_on_step_done)
 
         # monitor thread: drain control commands ~10x/s while the subprocess runs.
         monitor_stop = threading.Event()
@@ -1356,8 +1380,12 @@ class CliSolver:
                     self._drain_control_async(), loop)
                 try:
                     fut.result(timeout=1)
-                except Exception:
+                except concurrent.futures.TimeoutError:
+                    # loop busy — the drain coroutine is still queued; skip this
+                    # tick, the next one will pick up. Not fatal.
                     pass
+                except Exception:  # noqa: BLE001 — drain must never kill the monitor
+                    logger.exception("control drain failed in monitor thread")
                 monitor_stop.wait(0.1)
 
         monitor = threading.Thread(target=_monitor, name="cli-control-mon", daemon=True)
@@ -1904,14 +1932,28 @@ class CliSolver:
             poc_id = str(p.get("poc_id") or "")
             if not poc_id:
                 continue
+            # Round-3 audit: the pocs table is WORKER-WRITABLE (save_poc /
+            # claim_poc run inside the worker process). A hostile or confused
+            # worker can record poc_id / name / path with `..` or separators —
+            # splicing those into `wd / "inherited" / poc_id / name` and
+            # `root / path` below would create a symlink OUTSIDE the worker dir
+            # or pointing at an arbitrary file. Re-validate every component on
+            # the CONSUMER side before it touches a filesystem path (same rule
+            # as F35, now on the read path).
+            name = str(p.get("name") or Path(str(p.get("path") or "")).name)
+            if not is_clean_name(poc_id) or not is_clean_name(name):
+                continue
+            src = resolve_inside(root, str(p.get("path") or ""))
+            # src must exist — resolve_inside() does not check existence, and a
+            # stale row (CAS object already cleaned) would create a dangling
+            # symlink that silently points nowhere.
+            if src is None or not src.exists():
+                continue
             try:
                 if hasattr(sg, "claim_poc") and not sg.claim_poc(worker=self.solver_id, poc_id=poc_id):
                     continue
             except Exception:
                 continue
-            rel = str(p.get("path") or "")
-            name = Path(str(p.get("name") or Path(rel).name)).name
-            src = root / rel
             dst = wd / "inherited" / poc_id / name
             try:
                 relative_symlink(dst, src)

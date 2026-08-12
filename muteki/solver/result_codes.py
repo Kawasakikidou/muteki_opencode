@@ -53,3 +53,9 @@ def is_transient(code: str) -> bool:
 
 def is_neutral(code: str) -> bool:
     return normalize_result_code(code) in NEUTRAL_CODES
+
+
+def is_solved(code: str) -> bool:
+    """F30: single helper for the most common check — callers used to compare
+    against the bare string RESULT_SOLVED and drift."""
+    return normalize_result_code(code) == RESULT_SOLVED

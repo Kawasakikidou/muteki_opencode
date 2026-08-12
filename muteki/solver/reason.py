@@ -276,25 +276,79 @@ def build_reason_prompt(summary: str, max_intents: int = 4, *,
 
 
 def _extract_json(text: str) -> dict:
-    """Pull the first JSON object out of a model reply (robust to prose/fences)."""
+    """Pull the reason-reply JSON object out of a model reply.
+
+    run-fix (F18): a greedy `\{.*\}` was polluted by flag{...} / a second JSON
+    example (it spans the first `{` to the LAST `}`, so the parse failed and
+    the whole planning round silently went empty). Strategy: whole-text parse
+    first, then a balanced-brace scan — a non-greedy regex can't span NESTED
+    objects — trying every brace-balanced segment largest-first and accepting
+    only one that looks like a reason reply.
+    """
     if not text:
         return {}
     # strip ```json fences
-    text = re.sub(r"```(?:json)?", "", text)
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        return {}
+    text = re.sub(r"```(?:json)?", "", text).strip()
     try:
-        return json.loads(m.group(0))
+        d = json.loads(text)
+        if isinstance(d, dict):
+            return d
     except json.JSONDecodeError:
-        return {}
+        pass
+    # balanced-brace scan with string-state: a flag{...} or a JSON string
+    # containing braces must not corrupt depth counting.
+    candidates: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        j = i
+        while j < n:
+            c = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[i:j + 1])
+                    i = j
+                    break
+            j += 1
+        i += 1
+    for cand in sorted(candidates, key=len, reverse=True):
+        try:
+            d = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(d, dict) and ("intents" in d or "verdict" in d
+                                    or "goal_met" in d or "audit" in d):
+            return d
+    return {}
 
 
 def parse_reason_reply(text: str, *, max_intents: int = 4) -> ReasonResult:
     d = _extract_json(text)
     goal_met = bool(d.get("goal_met", False))
     intents: list[Intent] = []
-    for i, raw in enumerate(d.get("intents", [])[:max_intents]):
+    # F17: the model's JSON is free-form — intents may be an OBJECT or scalar,
+    # which used to raise TypeError and silently kill the whole planning round
+    # (swallowed by run_reason's caller). Guard every list-shaped field.
+    raw_intents = d.get("intents")
+    for i, raw in enumerate(
+            (raw_intents if isinstance(raw_intents, list) else [])[:max_intents]):
         if not isinstance(raw, dict):
             continue
         goal = str(raw.get("goal", "")).strip()
@@ -304,11 +358,20 @@ def parse_reason_reply(text: str, *, max_intents: int = 4) -> ReasonResult:
         if wc not in ("code", "shell_agent", "verifier", "review"):
             wc = "code"
         from_raw = raw.get("from", [])
-        from_facts = [int(x) for x in from_raw if isinstance(x, (int, float))]
+        # F19: string-numbered fact seqs are common in free JSON — coerce them
+        # instead of dropping them (dropped = intent_sources chain breaks).
+        from_facts: list[int] = []
+        for x in (from_raw if isinstance(from_raw, list) else []):
+            try:
+                from_facts.append(int(x))
+            except (TypeError, ValueError):
+                continue
         intents.append(Intent(
             intent_id=str(raw.get("id") or f"I{i+1}"),
             goal=goal, worker_class=wc,
-            depends_on=[str(x) for x in raw.get("depends_on", []) if x],
+            depends_on=[str(x) for x in
+                        (raw.get("depends_on") if isinstance(raw.get("depends_on"), list) else [])
+                        if x],
             rationale=str(raw.get("rationale", "")),
             from_facts=from_facts,
             route_hash=str(raw.get("route_hash") or "").strip(),
@@ -319,10 +382,12 @@ def parse_reason_reply(text: str, *, max_intents: int = 4) -> ReasonResult:
             dup_of=str(raw.get("dup_of") or "").strip(),
             reopen_because=str(raw.get("reopen_because") or "").strip(),
         ))
-    audit = [str(a) for a in d.get("audit", []) if a]
+    raw_audit = d.get("audit")
+    audit = [str(a) for a in (raw_audit if isinstance(raw_audit, list) else []) if a]
     pinned_facts: list[int] = []
     seen_pins: set[int] = set()
-    for raw in d.get("pinned_facts", []):
+    raw_pins = d.get("pinned_facts")
+    for raw in (raw_pins if isinstance(raw_pins, list) else []):
         try:
             seq = int(raw)
         except (TypeError, ValueError):
@@ -338,13 +403,29 @@ def parse_reason_reply(text: str, *, max_intents: int = 4) -> ReasonResult:
     verdict = str(d.get("verdict", "")).strip().lower()
     if verdict not in _VALID_VERDICTS:
         verdict = VERDICT_COMPLETE if goal_met else VERDICT_EXPLORE
-    # keep goal_met and verdict consistent for downstream callers
+    # F20: keep goal_met and verdict consistent BOTH ways (previously only
+    # verdict==complete → goal_met was forced; the reverse — goal_met=true with
+    # verdict=explore — left a contradictory "done but explore" state).
     if verdict == VERDICT_COMPLETE:
         goal_met = True
+    elif goal_met:
+        goal_met = False
     return ReasonResult(goal_met=goal_met, intents=intents, audit_notes=audit,
                         verdict=verdict, drift=drift, complete_why=complete_why,
-                        semantic_dedupe_available=isinstance(d.get("intents"), list),
+                        semantic_dedupe_available=_semantic_dedupe_available(d),
                         pinned_facts=pinned_facts)
+
+
+def _semantic_dedupe_available(d: dict) -> bool:
+    """F21: true dedupe availability means the model actually EMITTED dup_of
+    markers — not merely that `intents` happens to be a list. When it hasn't,
+    dispatch must keep the mechanical near-duplicate backstop on (the old
+    behavior switched it off entirely, trusting the prompt alone)."""
+    intents = d.get("intents")
+    if not isinstance(intents, list):
+        return False
+    return any(isinstance(it, dict) and str(it.get("dup_of") or "").strip()
+               for it in intents)
 
 
 async def run_reason(
@@ -521,6 +602,10 @@ def dispatch_intents(shared_graph: Any, result: ReasonResult, *,
             if route and it.worker_class not in {"verifier", "review"}:
                 batch_routes.add(route)
     if not proposed and not dispatchable_goals and skipped:
+        # F22: anti-starvation valve — when nothing got through, re-offer ONE
+        # skipped intent. Prefer ones dropped for a HARD reason (route-dedup)
+        # over soft near-duplicates, so a near-dup paraphrase is the LAST resort.
+        skipped.sort(key=lambda it: bool(it.dup_of))
         row = _propose_one(shared_graph, skipped[0], actor=actor)
         if row:
             proposed.append(row)

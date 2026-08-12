@@ -59,9 +59,14 @@ _ANCHOR_RE = re.compile(
     r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b|:\d{2,5}\b|"
     r"CVE-\d{4}-\d+|[A-Za-z0-9_.\\/-]+:[^\s]{4,})",
     re.IGNORECASE)
+# F23: the old second branch matched ANY 1-4 hanzi + period + latin token —
+# "端口。8080 开放" (a legal anchor-preserving gist) fell back to a clipped
+# head. Truncation tells end in a letter token ("中输出。Beta…" = a sentence
+# tail); a period followed by a DIGIT ("端口。8080") is the legitimate
+# hanzi-anchor shape and is no longer misjudged.
 _FRAGMENT_RE = re.compile(
     r"^[。，、；：！？.,;:!?…）》」』\])\s]"
-    r"|^[\u4e00-\u9fff]{1,4}[。.][A-Za-z0-9]"
+    r"|^[\u4e00-\u9fff]{1,4}[。.](?!\d)[A-Za-z0-9]"
 )
 
 _GIST_MAX = 120  # generous front-end label cap (was 40 — too short for a flag UUID)
@@ -174,16 +179,22 @@ async def summarize_node(
             pass
 
     if bus is not None and run_id is not None and summary:
-        await bus.emit(
-            Event(
-                event_type=EventType.NODE_SUMMARIZED,
-                run_id=run_id,
-                challenge_id=challenge_id,
-                payload=node_summarized_payload(
-                    summary, node_kind=node_kind,
-                    fact_seq=fact_seq, intent_id=intent_id),
+        try:
+            await bus.emit(
+                Event(
+                    event_type=EventType.NODE_SUMMARIZED,
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    payload=node_summarized_payload(
+                        summary, node_kind=node_kind,
+                        fact_seq=fact_seq, intent_id=intent_id),
+                )
             )
-        )
+        except Exception:
+            # F24: "Never raises" contract — the emit was outside the try, so a
+            # bus hiccup surfaced as an unhandled detached-task exception and the
+            # computed summary never arrived. Best-effort: drop it.
+            pass
     return summary
 
 
@@ -234,12 +245,15 @@ async def translate_need(
     # only emit when we got a translation that is actually different from the raw
     # ask (skip a no-op echo, e.g. the worker already wrote in Chinese).
     if zh and zh != raw and bus is not None and run_id is not None:
-        await bus.emit(
-            Event(
-                event_type=EventType.HITL_TRANSLATED,
-                run_id=run_id,
-                challenge_id=challenge_id,
-                payload=hitl_translated_payload(worker, need, zh),
+        try:
+            await bus.emit(
+                Event(
+                    event_type=EventType.HITL_TRANSLATED,
+                    run_id=run_id,
+                    challenge_id=challenge_id,
+                    payload=hitl_translated_payload(worker, need, zh),
+                )
             )
-        )
+        except Exception:
+            pass  # F24: never-raises contract, same as summarize_node
     return zh

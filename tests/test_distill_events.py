@@ -124,3 +124,36 @@ def test_single_flag_yaml_byte_identical(tmp_path):
     assert tpl.flag_evidence_chains == {}
     assert "flag_evidence_chains" not in tpl.to_yaml()
     g.close()
+
+
+def test_distill_sanitizes_hypothesis_statements() -> None:
+    # F32: a confirmed hypothesis that QUOTES the flag used to leak it straight
+    # into the shared YAML knowledge base — hypothesis steps must go through
+    # the same sanitizer as evidence.
+    from muteki.models.solve_graph import HypothesisStatus
+    g = SolveGraph(
+        challenge=Challenge(id="c2", name="x", category="web",
+                            description="simple leak"),
+    )
+    g.add_flag("flag{leak}")
+    h = g.add_hypothesis("submit flag{leak} returns 200 OK", "try it")
+    g.set_status(h.id, HypothesisStatus.CONFIRMED)
+    g.add_evidence(source="s", fact="server echoed flag{leak}", verified=True)
+    tpl = distill(g)
+    joined = "\n".join(tpl.steps)
+    assert "flag{leak}" not in joined
+    assert "<FLAG>" in joined
+
+
+def test_distill_keywords_cover_chinese() -> None:
+    # F31: CJK descriptions used to produce an EMPTY fingerprint (unrecallable).
+    from muteki.learning.distill import _keywords
+    kws = _keywords("一个简单的 RSA 加密题 低指数攻击")
+    assert kws, "chinese-only description must still yield keywords"
+
+
+def test_template_from_yaml_string_chain_not_splatted() -> None:
+    # F34: a string flag_evidence_chains value used to list()-splat into chars.
+    t = Template.from_yaml(
+        "name: t\ncategory: web\nflag_evidence_chains:\n  'flag #1': 'abc def'")
+    assert t.flag_evidence_chains["flag #1"] == ["abc def"]

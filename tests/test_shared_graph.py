@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 import pytest
@@ -66,6 +67,128 @@ def test_events_since_returns_incremental_filtered_rows(tmp_path):
     only_dead = g.events_since(0, kinds=["dead_end"])
     assert [e["kind"] for e in only_dead] == ["dead_end"]
     assert only_dead[0]["seq"] == d1
+    g.close()
+
+
+# ── run-fix: open_intents / set_intent_lane / count_events / _append 约束上抛 ──
+
+def test_open_intents_holds_back_non_active_dispatch_state(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I-active", goal="go")
+    g.propose_intent(actor="reason", intent_id="I-resume", goal="hold")
+    # 把 I-resume 置为 resume(非 dispatchable),即使 status 仍是 'open'
+    with g._lock:
+        g._conn.execute(
+            "UPDATE intents SET dispatch_state='resume' WHERE intent_id='I-resume'")
+        g._conn.commit()
+    ids = {i["intent_id"] for i in g.open_intents()}
+    assert "I-active" in ids
+    assert "I-resume" not in ids
+    g.close()
+
+
+def test_set_intent_lane_backfills_only_when_empty(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.propose_intent(actor="reason", intent_id="I1", goal="probe x")
+    g.set_intent_lane(intent_id="I1", lane_key="l:x", risk_class="c1")
+    # 已有 lane → 不覆盖
+    g.set_intent_lane(intent_id="I1", lane_key="l:y", risk_class="c2")
+    row = next(r for r in g.open_intents() if r["intent_id"] == "I1")
+    assert row["lane_key"] == "l:x"
+    assert row["risk_class"] == "c1"
+    g.close()
+
+
+def test_count_events_counts_kind_at_sql_layer(tmp_path):
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    g.add_evidence(actor="s1", source="x", fact="f1")
+    g.add_evidence(actor="s1", source="x", fact="f2")
+    g.add_dead_end(actor="s1", reason="nope")
+    assert g.count_events("fact_added") == 2
+    assert g.count_events("dead_end") == 1
+    assert g.count_events("flag_found") == 0
+    g.close()
+
+
+def test_append_raises_when_collision_is_not_proven_dedupe(monkeypatch, tmp_path):
+    """run-fix: _append 曾把一切 IntegrityError 当 dedupe 冲突吞掉(返回 -1),
+    真正的约束错误(外键/NOT NULL)会无声消失。现在只有消息精确命中
+    events.dedupe_key 的 UNIQUE 冲突才静默;其他约束错误必须上抛。"""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    assert g._append("fact_added", "s1", {"a": 1}, dedupe_key="k1") > 0
+    # 同 key 正常去重 → -1
+    assert g._append("fact_added", "s1", {"a": 2}, dedupe_key="k1") == -1
+    # 非 dedupe 约束错误(模拟 NOT NULL 违规)必须上抛而非静默 -1。
+    # sqlite3.Connection.execute 是 C 属性不可 patch,用代理连接包装。
+    real = g._conn
+
+    class _BoomConn:
+        def execute(self, sql, params=()):
+            if "INSERT INTO events" in str(sql):
+                raise sqlite3.IntegrityError(
+                    "NOT NULL constraint failed: events.payload")
+            return real.execute(sql, params)
+
+        def commit(self):
+            return real.commit()
+
+        def rollback(self):
+            return real.rollback()
+
+    monkeypatch.setattr(g, "_conn", _BoomConn())
+    with pytest.raises(sqlite3.IntegrityError):
+        g._append("fact_added", "s1", {"a": 3}, dedupe_key="k1")
+    monkeypatch.undo()  # restore the real connection so close() works
+    g.close()
+
+
+def test_append_dedupe_requires_sqlite_errorcode(monkeypatch, tmp_path):
+    """Round-5: dedupe is now keyed on sqlite_errorcode == SQLITE_CONSTRAINT_UNIQUE
+    AND the column-name message — a message that merely LOOKS like a UNIQUE
+    failure but carries a non-UNIQUE errorcode must still re-raise (the errorcode
+    is the API; the text is cosmetic)."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    real = g._conn
+
+    class _WrongCodeConn:
+        def execute(self, sql, params=()):
+            if "INSERT INTO events" in str(sql):
+                exc = sqlite3.IntegrityError(
+                    "UNIQUE constraint failed: events.dedupe_key")
+                exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_NOTNULL
+                raise exc
+            return real.execute(sql, params)
+
+        def commit(self):
+            return real.commit()
+
+        def rollback(self):
+            return real.rollback()
+
+    monkeypatch.setattr(g, "_conn", _WrongCodeConn())
+    with pytest.raises(sqlite3.IntegrityError):
+        g._append("fact_added", "s1", {"a": 4}, dedupe_key="k1")
+    monkeypatch.undo()
+
+    # A genuine UNIQUE errorcode on the dedupe column still dedupes → -1.
+    class _TrueCodeConn:
+        def execute(self, sql, params=()):
+            if "INSERT INTO events" in str(sql):
+                exc = sqlite3.IntegrityError(
+                    "UNIQUE constraint failed: events.dedupe_key")
+                exc.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+                raise exc
+            return real.execute(sql, params)
+
+        def commit(self):
+            return real.commit()
+
+        def rollback(self):
+            return real.rollback()
+
+    monkeypatch.setattr(g, "_conn", _TrueCodeConn())
+    assert g._append("fact_added", "s1", {"a": 5}, dedupe_key="k1") == -1
+    monkeypatch.undo()
     g.close()
 
 
@@ -462,6 +585,27 @@ def test_poc_save_claim_conclude_owner_fence_and_nullable_intent(tmp_path):
     g.conclude_poc(actor="cli-b", poc_id="poc-null", status="spent", note="done")
     assert g.pocs()[0]["status"] == "spent"
     assert {e["kind"] for e in g.events()} >= {"poc_saved", "poc_claimed", "poc_concluded"}
+    g.close()
+
+
+def test_poc_save_rejects_poisoned_ids_names_and_paths(tmp_path):
+    """Round-3 audit: save_poc rows are worker-writable and later spliced into
+    filesystem paths by the inheritance consumer — the WRITE side must refuse
+    `..` / separators / absolute paths before they reach the pocs table."""
+    g = SQLiteSharedGraph.open(db_path=tmp_path / "g.db", challenge=_chal())
+    good = dict(actor="cli-a", poc_id="poc-ok", path="shared/objects/aa/bb/hash",
+                artifact_id="hash", entry_command="x", name="poc.py")
+    g.save_poc(**good)
+    for bad_poc in ("../poc", "a/b", "poc\\x", "."):
+        with pytest.raises(ValueError):
+            g.save_poc(**{**good, "poc_id": bad_poc})
+    for bad_name in ("../poc.py", "a/b", "poc.py\\x"):
+        with pytest.raises(ValueError):
+            g.save_poc(**{**good, "name": bad_name})
+    for bad_path in ("../etc/passwd", "/etc/passwd", "C:\\evil", ""):
+        with pytest.raises(ValueError):
+            g.save_poc(**{**good, "path": bad_path})
+    assert [r["poc_id"] for r in g.pocs()] == ["poc-ok"]
     g.close()
 
 

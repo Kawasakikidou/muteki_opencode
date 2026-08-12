@@ -61,6 +61,10 @@ class Ledger:
     calls: int = 0
 
     def add(self, price: ModelPrice, input_tokens: int, output_tokens: int) -> float:
+        # F7: negative token counts (defensive — an API glitch) would shrink the
+        # ledger; clamp like add_external_usd already does.
+        input_tokens = max(0, int(input_tokens or 0))
+        output_tokens = max(0, int(output_tokens or 0))
         c = price.cost(input_tokens, output_tokens)
         self.usd += c
         self.input_tokens += input_tokens
@@ -112,6 +116,11 @@ class CostController:
         it). Pass 0 (the default) when the engine reports no token counts."""
         usd = max(0.0, float(usd))
         inp, outp = max(0, int(input_tokens)), max(0, int(output_tokens))
+        # F6: normalize empty-string scopes to None so "skip ledger bump" and
+        # "event carries the id" can't disagree (an empty-string challenge_id
+        # used to skip the bump but still ride along on the emitted event).
+        challenge_id = challenge_id or None
+        solver_id = solver_id or None
 
         def _bump(led: Ledger) -> None:
             led.usd += usd
@@ -154,6 +163,9 @@ class CostController:
         solver_id: Optional[str] = None,
     ) -> float:
         """Record one LLM call's usage; emit COST_UPDATE; return its USD cost."""
+        # F6: normalize empty-string scopes (see add_external_usd).
+        challenge_id = challenge_id or None
+        solver_id = solver_id or None
         price = self.price_for(model)
         cost = self._global.add(price, input_tokens, output_tokens)
         if challenge_id:

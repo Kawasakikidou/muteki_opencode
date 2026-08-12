@@ -7,7 +7,7 @@
 
 | 文件 | 说明 |
 |---|---|
-| `muteki-worker-slim-opencode.tar.gz` | 交付镜像(opencode 引擎 + ctf-kb 知识 skill + 黑板 skill + supervisor),约 0.96GB,压缩后 ~400MB |
+| `muteki-worker-slim-opencode.tar.gz` | 交付镜像(opencode 引擎 + ctf-kb 知识 skill + 黑板 skill + supervisor),0.96GB(镜像层已压缩,再 gzip 无收益) |
 | `load.sh` | 一键加载脚本(加载 + 打 tag + 验证) |
 
 ## 快速开始(目标机器)

@@ -329,3 +329,36 @@ def test_token_mode_rejects_rockyou_words_and_sentences(tmp_path):
     assert gate.flag_ok("the flag is the admin password", out,
                         flag_format=gate.TOKEN_FLAG_FORMAT, artifacts=None) is False
 
+
+def test_broken_flag_format_regex_degrades_not_crashes(tmp_path):
+    # run-fix: 操作员配置的 flag_format 是自由字符串,未转义 `{` 等会让
+    # re.search 直接抛 re.error 炸掉整个门禁。现在编译失败降级到 token
+    # 强度地板 —— 严格不宽松,不弱化门禁(弱内容照样拒,强 secret 不误伤)。
+    broken = "flag{invalid("  # re.error 源
+    # 弱内容(prose 形状 / 短 token)即使出现在 raw_output 也被地板拒绝
+    assert gate.flag_ok("flag{abc}", "out flag{abc}", flag_format=broken,
+                        artifacts=None) is False
+    assert gate.flag_ok("hello", "out hello", flag_format=broken,
+                        artifacts=None) is False
+    # 强 token 形状仍可通过(降级路径不误伤真实 secret)
+    real = "W3lc0m3T0Gh0st"
+    assert gate.flag_ok(real, "out " + real, flag_format=broken,
+                        artifacts=None) is True
+    # 正常格式路径行为完全不变
+    assert gate.flag_ok("flag{ok}", "out flag{ok}",
+                        flag_format=r"flag\{[^}]+\}", artifacts=None) is True
+    # 空格式保持原行为(恒匹配,占位符+出处仍生效)
+    assert gate.flag_ok("flag{ok}", "out flag{ok}", flag_format="",
+                        artifacts=None) is True
+
+
+def test_flag_format_regex_compile_is_cached():
+    # run-fix: _compile_flag_format 带 lru_cache —— 同样的 flag_format 字符串
+    # 只编译一次(flag_ok 对每个候选 flag 都会调用)。行为不变,且缓存路径
+    # (broken regex → None) 同样稳定。
+    ok1 = gate._compile_flag_format(r"flag\{[^}]+\}")
+    ok2 = gate._compile_flag_format(r"flag\{[^}]+\}")
+    assert ok1 is ok2, "identical formats must hit the cache"
+    assert gate._compile_flag_format("flag{invalid(") is None
+    assert gate._compile_flag_format("flag{invalid(") is None
+

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -240,15 +241,21 @@ def _probe_container(*, engine: str, account_id: str, root: Path) -> dict[str, A
         except OSError as exc:
             return _result(False, f"凭据投影失败: {str(exc)[:120]}", layer="mount")
 
-        bin_path = _CONTAINER_BIN.get(engine, engine)
+        bin_path = _CONTAINER_BIN.get(engine)
+        if bin_path is None:
+            # H4: engine must be a KNOWN engine — a raw request-body value used to
+            # fall through to `_CONTAINER_BIN.get(engine, engine)` and get spliced
+            # into a `bash -lc` script (command injection, credential exfil via
+            # the probe's stdout echo). Whitelist rejects everything else.
+            return _result(False, f"未知引擎: {engine!r}", layer="cli")
         # in-container probe: the credential file must be READABLE at the mount
         # path (catches #15 uid-mismatch) AND the engine binary must launch
         # (--version is the cheap liveness check; a full authed turn would spend
         # quota + need network, out of scope for a plumbing test).
         cred_path = f"{CONTAINER_ACCOUNTS_ROOT}/{account_id}"
         script = (
-            f"test -r {cred_path} || {{ echo MUTEKI_MOUNT_UNREADABLE; exit 71; }}; "
-            f"{bin_path} --version >/dev/null 2>&1 || {{ echo MUTEKI_CLI_FAIL; exit 72; }}; "
+            f"test -r {shlex.quote(cred_path)} || {{ echo MUTEKI_MOUNT_UNREADABLE; exit 71; }}; "
+            f"{shlex.quote(bin_path)} --version >/dev/null 2>&1 || {{ echo MUTEKI_CLI_FAIL; exit 72; }}; "
             "echo MUTEKI_OK"
         )
         run_cmd = [

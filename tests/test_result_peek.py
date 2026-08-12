@@ -63,3 +63,55 @@ def test_peek_query_no_match(tmp_path: Path) -> None:
     aid = store.put("nothing here\nor here")
     p = peek(store, aid, query="flag")
     assert p.found is True and p.matched is False
+
+
+def test_peek_rejects_path_traversal_artifact_id(tmp_path: Path) -> None:
+    # F27: a model-controlled artifact_id must never escape the store root —
+    # ../../ style ids resolve to "not found", not an arbitrary file read.
+    store = ArtifactStore(root=tmp_path)
+    aid = store.put("secret")
+    for evil in ("../x", "..\\x", "*", "../../shared_graph.db", "aid;"):
+        p = peek(store, evil)
+        assert p.found is False, evil
+    # canonical id still resolves
+    assert peek(store, aid).found is True
+
+
+def test_peek_tolerates_invalid_regex(tmp_path: Path) -> None:
+    # F28: an invalid model-supplied regex must degrade, not raise.
+    store = ArtifactStore(root=tmp_path)
+    aid = store.put("alpha beta gamma")
+    p = peek(store, aid, query="(unclosed")
+    assert p.found is True and p.matched is False
+
+
+def test_peek_refuses_catastrophic_backtracking_regex(tmp_path: Path) -> None:
+    # Round-5: `(a+)+` / `(a|ab)+$` / `(\w+\s*)+` are the exponential-backtracking
+    # shapes — a model-controlled query must degrade to "no match" instantly,
+    # never hang the worker. The 200-char cap alone does NOT stop these.
+    store = ArtifactStore(root=tmp_path)
+    aid = store.put("a" * 100_000)  # a long line that would trigger the blowup
+    for evil in (r"(a+)+", r"(a|ab)+$", r"(\w+\s*)+", r"([0-9]+)+", r"(a|b)+"):
+        p = peek(store, aid, query=evil)
+        assert p.found is True and p.matched is False, evil
+
+
+def test_peek_skips_oversized_lines_when_searching(tmp_path: Path) -> None:
+    # Round-5: even a benign regex scanning a single >64 KiB line is quadratic
+    # on `.*`-style scans — such lines are excluded from matching (content that
+    # big can't be shown in a peek anyway).
+    store = ArtifactStore(root=tmp_path)
+    aid = store.put(("x" * 200_000) + "\nflag{on_short_line}")
+    p = peek(store, aid, query="flag")
+    assert p.found is True and p.matched is True
+    assert "flag{on_short_line}" in p.content
+
+
+def test_peek_benign_regexes_still_match(tmp_path: Path) -> None:
+    # Round-5: the ReDoS heuristic must not reject ordinary search patterns.
+    store = ArtifactStore(root=tmp_path)
+    aid = store.put("host 10.0.0.1 port 8080")
+    for ok in (r"\d+\.\d+\.\d+\.\d+", r"flag\{[0-9a-f]{32}\}", r"[A-Za-z]+ \d+",
+               r"(\d{4})-(\d{2})", r"cat|dog", r"a+b+"):
+        p = peek(store, aid, query=ok)
+        assert p.found is True, ok

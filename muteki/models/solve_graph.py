@@ -124,6 +124,9 @@ class SolveGraph(BaseModel):
         `flag`/`flags` invariant. A flag the operator rejected as a false positive
         is permanently refused here too — so a re-derivation after reopen cannot
         slip back in via this path. Returns True if it was new."""
+        # F13: normalize whitespace — a trailing newline / stray spaces produced
+        # duplicate variants of the same flag value.
+        flag = str(flag or "").strip()
         if not flag or flag in self.flags or flag in self.rejected_flags:
             return False
         self.flags.append(flag)
@@ -177,6 +180,11 @@ class SolveGraph(BaseModel):
         self, statement: str, rationale: str, priority: float = 0.5, id: Optional[str] = None
     ) -> Hypothesis:
         hid = id or self._next_hid()
+        # F12: a caller-supplied custom id used to bypass uniqueness — get/status
+        # hit only the FIRST row, silently corrupting the H-id invariant and
+        # `_next_hid`'s numbering. Fall back to the derived id on collision.
+        if hid in {h.id for h in self.hypotheses}:
+            hid = self._next_hid()
         h = Hypothesis(id=hid, statement=statement, rationale=rationale, priority=priority)
         self.hypotheses.append(h)
         return h
@@ -195,6 +203,12 @@ class SolveGraph(BaseModel):
             h.refuted_reason = refuted_reason
             if refuted_reason and refuted_reason not in self.dead_ends:
                 self.dead_ends.append(refuted_reason)
+        else:
+            # F10: leaving a stale refuted_reason on a CONFIRMED hypothesis made
+            # the summary show "confirmed" AND its dead-end reason in the same
+            # board — contradictory. Dead-ends stay permanent (append-only), the
+            # per-hypothesis field does not.
+            h.refuted_reason = None
         return h
 
     def mark_dead_end(self, reason: str) -> None:
@@ -242,8 +256,13 @@ class SolveGraph(BaseModel):
             # (verifier set), split Verified vs Candidates so reason/solver do
             # NOT treat unverified facts as established. Before the gate is wired
             # (P-A), behave exactly as before — single "Confirmed evidence" block.
-            gated = any(ev.verifier for ev in self.evidence)
             recent = self.evidence[-max_evidence:]
+            # F11: gate mode is decided by the WINDOW, not the full history — a
+            # single verifier-gated row outside the window used to flip the whole
+            # view into "Verified/Candidates" while showing none of the verified
+            # rows (they'd been pushed out), hiding confirmed evidence from the
+            # planner.
+            gated = any(ev.verifier for ev in recent)
             if not gated:
                 lines.append("\n## Confirmed evidence")
                 for ev in recent:

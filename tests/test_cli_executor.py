@@ -2393,6 +2393,76 @@ def test_inherited_poc_mounts_under_inherited_and_claims(tmp_path):
     assert "python poc.py" in s._poc_prompt_block()
 
 
+def test_inherited_poc_poisoned_rows_are_skipped_not_spliced(tmp_path):
+    """Round-3 audit: the pocs table is worker-writable — a row carrying `..` /
+    separators / an escaping path must be SKIPPED on the consumer side, never
+    spliced into `wd / inherited / <poc_id> / <name>` or `root / <path>` (which
+    would create a symlink OUTSIDE the worker dir / pointing at an arbitrary
+    file). Insert the poisoned rows straight into SQL to bypass the write-side
+    guard and prove the consumer defends on its own."""
+    ch = Challenge(id="poc-poison", name="poc-poison", category="web",
+                   flag_format=r"flag\{[^}]+\}")
+    root = _P(tmp_path) / "run" / "workspace"
+    root.mkdir(parents=True)
+    g = SQLiteSharedGraph(str(root / "graph" / "shared_graph.db"), ch)
+    with g._lock:
+        for poc_id, name, path in (
+            ("../../escape1", "poc.py", "shared/objects/aa/bb/hash"),
+            ("poc-ok2", "../../escape2.py", "shared/objects/aa/bb/hash"),
+            ("poc-ok3", "poc.py", "../../../../etc/passwd"),
+        ):
+            g._conn.execute(
+                "INSERT INTO pocs (poc_id, challenge_id, name, path, "
+                " entry_command, status, created_seq) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (poc_id, ch.id, name, path, "python poc.py", "available", 1),
+            )
+        g._conn.commit()
+    wd = root / "workers" / "cli-2"
+    wd.mkdir(parents=True)
+    s = _cli_solver(ch, kb=False, shared_graph=g, workdir=str(wd))
+
+    s._link_inherited_pocs(root, wd)
+
+    inherited_dir = wd / "inherited"
+    assert not inherited_dir.exists() or not any(inherited_dir.iterdir()), \
+        "poisoned rows must not be linked into the worker dir"
+    # no symlink escapes: poc_id "../../escape1" → wd.parent/escape1;
+    # name "../../escape2.py" → wd/escape2.py; escaping path → resolve_inside None.
+    assert not (wd.parent / "escape1").exists()
+    assert not (wd / "escape2.py").exists()
+    assert not (root.parent / "etc" / "passwd").exists()
+
+
+def test_inherited_poc_stale_missing_object_is_skipped_not_dangling(tmp_path):
+    """Round-4 audit: a row whose path is CLEAN but whose CAS object was already
+    cleaned up must be skipped — resolve_inside() doesn't check existence, and
+    linking a missing target would leave a dangling symlink that points nowhere."""
+    ch = Challenge(id="poc-stale", name="poc-stale", category="web",
+                   flag_format=r"flag\{[^}]+\}")
+    root = _P(tmp_path) / "run" / "workspace"
+    root.mkdir(parents=True)
+    g = SQLiteSharedGraph(str(root / "graph" / "shared_graph.db"), ch)
+    with g._lock:
+        g._conn.execute(
+            "INSERT INTO pocs (poc_id, challenge_id, name, path, "
+            " entry_command, status, created_seq) "
+            "VALUES (?,?,?,?,?,?,?)",
+            ("poc-stale1", ch.id, "poc.py", "shared/objects/aa/bb/deadbeef",
+             "python poc.py", "available", 1),
+        )
+        g._conn.commit()
+    wd = root / "workers" / "cli-2"
+    wd.mkdir(parents=True)
+    s = _cli_solver(ch, kb=False, shared_graph=g, workdir=str(wd))
+
+    s._link_inherited_pocs(root, wd)
+
+    inherited_dir = wd / "inherited"
+    assert not inherited_dir.exists() or not any(inherited_dir.iterdir())
+    # not claimed either — a skipped row must not flip to wip
+    assert g.pocs()[0]["status"] == "available"
+
 def test_to_board_markdown_has_creds_facts_and_intents(tmp_path):
     ch, g = _real_graph(
         tmp_path,

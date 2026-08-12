@@ -11,8 +11,87 @@ from pathlib import Path
 import pytest
 
 from muteki.batch.ctf_runner import (
-    BatchConfig, _challenge_from_spec, load_manifest, write_report,
+    BatchConfig, _challenge_from_spec, config_from_manifest, load_manifest,
+    write_report,
 )
+
+
+def test_config_from_manifest_parses_retry_and_coordinator_fields():
+    cfg = config_from_manifest({
+        "challenges": [{"id": "c1"}],
+        "engines": ["opencode"],
+        "timeout": 120,
+        "retry": 2,
+        "retry_budget_scale": 1.5,
+        "coordinator": True,
+        "start_workers": 2,
+        "max_workers": 3,
+    })
+    assert cfg.retry == 2
+    assert cfg.retry_budget_scale == 1.5
+    assert cfg.coordinator is True
+    assert cfg.start_workers == 2 and cfg.max_workers == 3
+    assert cfg.timeout == 120
+    # 缺省值保持快解默认(不意外开启 coordinator/重试)
+    default = config_from_manifest({"challenges": []})
+    assert default.retry == 0 and default.coordinator is False
+    assert default.start_workers == 1 and default.max_workers == 1
+
+
+def test_run_one_retries_with_relay_semantics(tmp_path, monkeypatch):
+    """run-fix: 失败重试 = 接力 —— 同一 graph_dir + cold_start=(attempt==0),
+    第二轮复用第一轮的 shared_graph.db(证据/dead-end/rejected flags 全保留),
+    不是重头再来;墙钟预算按 retry_budget_scale 递增。"""
+    import asyncio
+    from types import SimpleNamespace
+
+    from muteki.batch.ctf_runner import BatchConfig, _run_one
+
+    monkeypatch.setenv("MUTEKI_KNOWLEDGE_DIR", str(tmp_path / "knowledge"))
+
+    calls: list[dict] = []
+    fail_first: dict[str, bool] = {"on": True}
+
+    class FakeSwarm:
+        def __init__(self, *args, **kwargs):
+            self._kwargs = kwargs
+            calls.append(kwargs)
+
+        async def run(self):
+            # 发一个真实事件,让 SessionStore sink 真正落盘(验证 batch 的事件
+            # 流持久化链路,而不只是"注册了 sink")
+            bus = self._kwargs.get("bus")
+            if bus is not None:
+                from muteki.core.event_bus import Event
+                from muteki.core.events import EventType
+                await bus.emit(Event(
+                    event_type=EventType.RUN_STARTED,
+                    run_id=self._kwargs["run_id"],
+                    ts=0.0, payload={"challenge": {"name": "x"}}))
+            solved = not fail_first["on"] or len(calls) >= 2
+            return SimpleNamespace(solved=solved, flags=[], error=None)
+
+    monkeypatch.setattr("muteki.batch.ctf_runner.Swarm", FakeSwarm)
+
+    spec = {"id": "c1", "name": "x", "category": "web"}
+    cfg = BatchConfig(retry=1, timeout=60, retry_budget_scale=2.0)
+    res = asyncio.run(_run_one(spec, cfg, tmp_path / "work", 1, 1))
+    assert res.solved is True
+    assert len(calls) == 2, "第一轮失败后必须接力第二轮"
+    assert calls[0]["cold_start"] is True
+    assert calls[1]["cold_start"] is False, "接力轮必须复用已有图"
+    assert calls[0]["graph_dir"] == calls[1]["graph_dir"], "接力:同一张图"
+    assert calls[0]["wall_clock_budget"] == 60
+    assert calls[1]["wall_clock_budget"] == 120, "scale=2.0 → 第二轮预算翻倍"
+    assert len(res.notes) + 1 == 2, "两轮尝试"
+    assert res.events_path.endswith(".jsonl")
+    # 事件流确实落盘了(bus 挂了 SessionStore sink)
+    assert (tmp_path / "work" / "sessions" / "batch-c1.jsonl").exists()
+    # 全部解出后不再额外重试
+    calls.clear()
+    fail_first["on"] = False
+    res2 = asyncio.run(_run_one(spec, cfg, tmp_path / "work2", 1, 1))
+    assert len(calls) == 1 and res2.solved is True
 
 
 def test_load_manifest_rejects_bad_shape(tmp_path):

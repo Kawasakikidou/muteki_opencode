@@ -143,3 +143,45 @@ def test_solvegraph_roundtrip_carries_flags() -> None:
     g.add_flag("flag{b}")
     g2 = SolveGraph.model_validate(g.model_dump())
     assert g2.flags == ["flag{a}", "flag{b}"] and g2.flag == "flag{a}"
+
+
+def test_set_status_clears_refuted_reason_on_exit() -> None:
+    # F10: leaving a stale refuted_reason on a CONFIRMED hypothesis made the
+    # summary self-contradictory.
+    g = _graph()
+    h = g.add_hypothesis("dir traversal on /download", "id param")
+    g.set_status(h.id, HypothesisStatus.REFUTED, "filtered input")
+    assert h.refuted_reason == "filtered input"
+    g.set_status(h.id, HypothesisStatus.CONFIRMED)
+    assert h.refuted_reason is None
+    assert "filtered input" in g.dead_ends  # dead-ends stay permanent
+
+
+def test_gated_mode_follows_recent_window() -> None:
+    # F11: a verifier-gated row OUTSIDE the summary window must not flip the
+    # whole view into Verified/Candidates (hiding verified evidence).
+    g = _graph()
+    g.add_evidence(source="s", fact="old verified", verified=True, verifier="gate")
+    for i in range(20):
+        g.add_evidence(source="s", fact=f"cand {i}", verified=False)
+    s = g.to_summary(max_evidence=12)
+    assert "## Confirmed evidence" in s  # window has NO gated rows → flat mode
+    g.add_evidence(source="s", fact="new verified", verified=True, verifier="gate")
+    s2 = g.to_summary(max_evidence=12)
+    assert "## Verified evidence" in s2  # now the window sees a gated row
+
+
+def test_add_hypothesis_duplicate_custom_id_falls_back() -> None:
+    # F12: a duplicate caller-supplied id must not corrupt the H-id invariant.
+    g = _graph()
+    h1 = g.add_hypothesis("first", "r", id="H1")
+    h2 = g.add_hypothesis("second", "r", id="H1")  # collides → derived id
+    assert h1.id != h2.id
+    assert len({h.id for h in g.hypotheses}) == len(g.hypotheses)
+
+
+def test_add_flag_strips_whitespace() -> None:
+    # F13: trailing whitespace produced duplicate flag variants.
+    g = _graph()
+    assert g.add_flag("flag{a}") is True
+    assert g.add_flag(" flag{a} \n") is False  # same value after strip

@@ -60,12 +60,15 @@ def base_engine_for_profile(profile_or_name: Any) -> str:
         return TRANSPORT_TO_ENGINE[s]
     if s in VALID_BASE_ENGINES:
         return s
-    # profile id like "codex-sub-container" / "cursor-api-container" → recover base.
-    for seg in s.split("-"):
-        if seg in VALID_BASE_ENGINES:
-            return seg
-        if seg in TRANSPORT_TO_ENGINE:
-            return TRANSPORT_TO_ENGINE[seg]
+    # F40: profile id like "codex-sub-container" / "cursor-api-container" →
+    # recover base — but ONLY from the FIRST segment. "sub-codex" / "my-claude-
+    # runner" used to resolve an engine out of the MIDDLE of an arbitrary string,
+    # silently masking typos and misconfigurations.
+    first = s.split("-", 1)[0]
+    if first in VALID_BASE_ENGINES:
+        return first
+    if first in TRANSPORT_TO_ENGINE:
+        return TRANSPORT_TO_ENGINE[first]
     return s
 
 
@@ -112,6 +115,11 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         raw_account = item.get("credential_account_ref")
     else:
         raw_account = f"{engine}-main"
+    # NOTE: an explicit EMPTY credential_account is INTENTIONAL — local +
+    # subscription mode means "inherit the host CLI login", and
+    # test_config_preserves_blank_credential_account_for_local_subscription_cli
+    # pins that. Do NOT substitute the {engine}-main default here (an earlier
+    # "fix" for that broke the contract).
     credential_account = str(raw_account or "").strip()
     normalized = {
         "id": pid,
@@ -130,7 +138,10 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "wire_api": str(item.get("wire_api") or ("responses" if engine == "codex" else "")).strip(),
         "runtime": str(item.get("runtime") or "docker-web").strip(),
         "roles": roles,
-        "race": bool(item.get("race", "race" in roles)),
+        # F39: web config / env injection often hands booleans as STRINGS —
+        # bool("false") is True, which silently put a "race": "false" profile
+        # into the race roster. Coerce like the other fields.
+        "race": _coerce_bool(item.get("race", "race" in roles)),
         "max_running": coerce_pos_int(item.get("max_running"), 1),
         # 0 means "inherit the global review.max_concurrent"; review capacity is
         # intentionally separate from max_running, which now only gates ordinary
@@ -141,6 +152,14 @@ def normalize_worker_profile(item: dict[str, Any], *, reject_invalid: bool = Fal
         "enabled": True,
     }
     return normalized
+
+
+def _coerce_bool(v: Any) -> bool:
+    """F39: string-safe bool coercion — 'false'/'0'/'no'/'off' are False;
+    non-string values use plain bool()."""
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(v)
 
 
 def normalize_worker_profiles(value: Any, *, defaults: list[dict[str, Any]] | None = None,
@@ -163,7 +182,15 @@ def normalize_worker_profiles(value: Any, *, defaults: list[dict[str, Any]] | No
             continue
         seen.add(profile["name"])
         out.append(profile)
-    return out or [dict(p) for p in (defaults or [])]
+    if not value:
+        # explicit EMPTY config → defaults (historical behavior)
+        return [dict(p) for p in (defaults or [])]
+    # F41: a NON-empty config that filtered down to nothing (all profiles
+    # invalid / all disabled) must NOT silently fall back to defaults — the
+    # operator explicitly configured something, often meaning "disable the
+    # engines"; resurrecting the default roster would re-enable them behind
+    # the operator's back.
+    return out
 
 
 def profile_names(profiles: list[dict[str, Any]]) -> list[str]:

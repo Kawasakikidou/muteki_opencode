@@ -46,6 +46,13 @@ def test_clean_rejects_mid_sentence_fragments():
     assert _clean("Beta 真实 flag 在 HTTP 头 X-Muteki-Flag，非响应体。", raw).startswith("Beta")
 
 
+def test_clean_accepts_hanzi_anchor_gist():
+    # F23: "端口。8080 已开放" is a legitimate anchor-preserving gist — a
+    # hanzi phrase + period + DIGIT was being misjudged as a cut fragment and
+    # degraded to a clipped English head.
+    assert _clean("端口。8080 已开放", "raw 端口。8080 已开放") == "端口。8080 已开放"
+
+
 def test_payload_shape():
     p = node_summarized_payload("中文提炼", node_kind="fact", fact_seq=7)
     assert p == {"summary": "中文提炼", "node_kind": "fact", "fact_seq": 7, "intent_id": ""}

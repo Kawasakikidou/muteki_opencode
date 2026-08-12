@@ -113,13 +113,21 @@ def tool_result_payload(
     }
 
 
+def _guard_fields(fields: dict[str, Any], *reserved: str) -> dict[str, Any]:
+    """F8: strip caller-supplied keys that would OVERRIDE the constructor's own
+    keys (`{"kind": kind, **fields}` silently let a fields={"kind": ...} payload
+    clobber the stable event shape)."""
+    return {k: v for k, v in fields.items() if k not in reserved}
+
+
 def insight_payload(kind: str, **fields: Any) -> dict[str, Any]:
     """kind in {FactDiscovered, DeadEndMarked, FlagFound, ...}; fields are kind-specific."""
-    return {"kind": kind, **fields}
+    return {"kind": kind, **_guard_fields(fields, "kind")}
 
 
 def cost_payload(scope: str, usd: float, tokens: int, **extra: Any) -> dict[str, Any]:
-    return {"scope": scope, "usd": round(usd, 6), "tokens": tokens, **extra}
+    return {"scope": scope, "usd": round(usd, 6), "tokens": tokens,
+            **_guard_fields(extra, "scope", "usd", "tokens")}
 
 
 def worker_status_payload(
@@ -148,7 +156,7 @@ def worker_status_payload(
 
 def hitl_response_payload(target: str, action: str, **fields: Any) -> dict[str, Any]:
     """target like 'global' | 'challenge:c1' | 'solver:opus-max'; action like 'hint'|'pause'."""
-    return {"target": target, "action": action, **fields}
+    return {"target": target, "action": action, **_guard_fields(fields, "target", "action")}
 
 
 def hitl_request_payload(worker: str, need: str, *, kind: str = "need_input",
@@ -158,12 +166,13 @@ def hitl_request_payload(worker: str, need: str, *, kind: str = "need_input",
     (`kind="env_down"`: target unreachable/expired). `need` is the concrete ask.
     The deck renders this so the operator knows what to provide; the coordinator
     pauses re-spawning that direction until an operator command arrives."""
-    return {"worker": worker, "need": need, "kind": kind, **fields}
+    return {"worker": worker, "need": need, "kind": kind,
+            **_guard_fields(fields, "worker", "need", "kind")}
 
 
 def solve_graph_delta_payload(kind: str, **fields: Any) -> dict[str, Any]:
     """kind in {evidence_added, hypothesis_added, hypothesis_status, dead_end, flag}."""
-    return {"kind": kind, **fields}
+    return {"kind": kind, **_guard_fields(fields, "kind")}
 
 
 def shared_graph_delta_payload(

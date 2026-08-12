@@ -65,3 +65,31 @@ def test_cleanup_worker_scratch_preserves_winner_only(tmp_path):
     assert (workers / "_homes").exists()
     assert (workspace / "shared").exists()
     assert (workspace / "graph" / "shared_graph.db").exists()
+
+
+def test_materialize_input_rejects_unsafe_names(tmp_path):
+    # F35: `..` / `.` / separators must never reach the CAS layout (a `..`
+    # link used to be created in the worker dir's PARENT).
+    from muteki.solver.workspace import workspace_root_for_worker
+    import pytest as _pytest
+    ws = tmp_path / "ws"
+    (ws / "workers" / "w1").mkdir(parents=True)
+    f = tmp_path / "f.txt"
+    f.write_text("x")
+    for bad in ("..", ".", "a/b", "a\\b"):
+        with _pytest.raises(ValueError):
+            materialize_input(ws, f, name=bad)
+        with _pytest.raises(ValueError):
+            from muteki.solver.workspace import link_input_into_worker
+            link_input_into_worker(ws, ws / "workers" / "w1", bad)
+
+
+def test_workspace_root_for_nested_worker_cwd(tmp_path):
+    # F36: a worker that created nested subdirs used to resolve the wrong root
+    # and seed the CAS layout into its own subtree.
+    from muteki.solver.workspace import workspace_root_for_worker
+    ws = tmp_path / "ws"
+    deep = ws / "workers" / "cli-claude-1" / "nested" / "deeper"
+    deep.mkdir(parents=True)
+    root = workspace_root_for_worker(deep)
+    assert root == ws.resolve()

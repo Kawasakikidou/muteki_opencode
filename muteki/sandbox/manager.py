@@ -23,12 +23,10 @@ class SandboxManager:
         *,
         root: Optional[str | Path] = None,
         artifacts_dir: Optional[str | Path] = None,
-        mem_mb: int = 2048,
-        cpu_s: int = 120,
     ) -> None:
+        # mem_mb / cpu_s were dead params from the retired per-solver kernel era
+        # (run-fix) — nothing reads them anymore, so they were removed.
         self.bus = bus
-        self.mem_mb = mem_mb
-        self.cpu_s = cpu_s
         self._root = Path(root) if root else Path(tempfile.mkdtemp(prefix="muteki-sbx-"))
         self._root.mkdir(parents=True, exist_ok=True)
         self._artifacts_dir = (

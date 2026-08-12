@@ -213,6 +213,57 @@ def check_password(cfg: AuthConfig, password: Optional[str]) -> bool:
         (password or "").encode("utf-8"), cfg.password.encode("utf-8"))
 
 
+@dataclass
+class LoginThrottle:
+    """M2: per-client-IP failed-login lockout for the password endpoint.
+
+    The operator password is the single gate in front of the whole API when
+    bound to a non-loopback host; without this, an attacker could brute-force
+    it at hundreds of attempts per second. Sliding window: `max_fails` failures
+    within `window_s` → HTTP 429 until the window slides out. A successful
+    login clears the client's failure record (the real operator typing the
+    right password shouldn't stay locked out by prior fat-fingering)."""
+
+    window_s: float = 300.0
+    max_fails: int = 5
+    # Bounded (Round-5): cap the tracked-IP table so a long-lived, exposed
+    # backend can't accumulate dead IP records forever. Worst case (all held)
+    # drops the oldest — the oldest IP's window is likeliest to have slid out.
+    _fails: dict[str, list[float]] = field(default_factory=dict)
+    _MAX_IPS: int = 4096
+
+    def _sweep(self, ip: str, now: float) -> list[float]:
+        ts = [t for t in self._fails.get(ip, []) if now - t < self.window_s]
+        self._fails[ip] = ts
+        return ts
+
+    def _cap_table(self) -> None:
+        if len(self._fails) <= self._MAX_IPS:
+            return
+        # drop stale (empty-window) entries first, then the oldest by insertion
+        for rid in [r for r, ts in self._fails.items() if not ts]:
+            del self._fails[rid]
+        while len(self._fails) > self._MAX_IPS:
+            del self._fails[next(iter(self._fails))]
+
+    def check(self, ip: str, *, now: Optional[float] = None) -> None:
+        """Raise HTTP 429 when the client is in lockout. Import FastAPI lazily so
+        this module stays importable in non-web tests."""
+        now = now if now is not None else time.time()
+        if len(self._sweep(ip, now)) >= self.max_fails:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=429,
+                                detail="too many failed login attempts; try later")
+
+    def fail(self, ip: str, *, now: Optional[float] = None) -> None:
+        now = now if now is not None else time.time()
+        self._fails.setdefault(ip, []).append(now)
+        self._cap_table()
+
+    def ok(self, ip: str) -> None:
+        self._fails.pop(ip, None)
+
+
 def bearer_from_header(authorization: Optional[str]) -> Optional[str]:
     """Extract the token from an `Authorization: Bearer <token>` header."""
     if not authorization:

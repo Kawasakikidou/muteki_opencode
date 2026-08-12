@@ -60,6 +60,56 @@ def test_parse_garbage_is_safe():
     assert r.goal_met is False
 
 
+def test_parse_intents_as_object_does_not_crash():
+    # F17: the model emitted an OBJECT where a list belongs — used to raise
+    # TypeError and silently kill the whole planning round.
+    r = parse_reason_reply(
+        '{"verdict":"explore","intents":{"I1":{"goal":"x"},"I2":{"goal":"y"}}}')
+    assert r.intents == []
+    assert r.verdict == "explore"
+
+
+def test_parse_pinned_facts_scalar_does_not_crash():
+    # F17: scalar where a list belongs.
+    r = parse_reason_reply('{"goal_met":true,"pinned_facts":3}')
+    assert r.pinned_facts == []
+    assert r.goal_met is True
+
+
+def test_parse_survives_flag_brace_pollution():
+    # F18: greedy \{.*\} used to swallow prose containing flag{...} — the whole
+    # JSON parse failed and planning went empty.
+    r = parse_reason_reply(
+        'the format is flag{anything} here\n{"verdict":"explore",'
+        '"intents":[{"id":"I1","goal":"probe login","from":[1]}]}\n'
+        "also flag{example}")
+    assert len(r.intents) == 1
+    assert r.intents[0].goal == "probe login"
+
+
+def test_parse_from_facts_accepts_string_numbers():
+    # F19: string-numbered fact seqs must coerce, not vanish.
+    r = parse_reason_reply(
+        '{"intents":[{"id":"I1","goal":"g","from":["3","7",5,"nope"]}]}')
+    assert r.intents[0].from_facts == [3, 7, 5]
+
+
+def test_goal_met_verdict_consistent_both_ways():
+    # F20: goal_met=true with verdict=explore must be normalized to false
+    # (verdict wins), not left as a contradictory "done but explore".
+    r = parse_reason_reply('{"goal_met":true,"verdict":"explore"}')
+    assert r.goal_met is False
+    assert r.verdict == "explore"
+
+
+def test_semantic_dedupe_requires_actual_dup_of():
+    # F21: a bare intents LIST does not enable semantic dedupe — only real
+    # dup_of markers do.
+    assert parse_reason_reply('{"intents":[{"id":"I1","goal":"g"}]}').semantic_dedupe_available is False
+    assert parse_reason_reply(
+        '{"intents":[{"id":"I1","goal":"g","dup_of":"I0"}]}').semantic_dedupe_available is True
+
+
 def test_shell_agent_only_when_declared():
     reply = '{"intents":[{"id":"I1","goal":"deep RE long chain","worker_class":"shell_agent"}]}'
     r = parse_reason_reply(reply)
