@@ -42,6 +42,7 @@ from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 from apps.web.auth import (
     PUBLIC_API_PATHS,
     AuthConfig,
+    LoginThrottle,
     TicketStore,
     bearer_from_header,
     check_password,
