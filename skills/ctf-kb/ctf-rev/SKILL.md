@@ -27,9 +27,10 @@ routing:
 2. **定位入口与关键点**:找 `main`、可疑符号、引用 flag 提示字符串/`printf`/`strcmp` 的交叉引用;`strings` 里出现 `flag`/`congrat`/`key` 等字样时,直接追踪其引用函数
 3. **反编译关键函数**(首选 Ghidra headless):
    ```bash
-   # 注意:不要直接运行 `ghidra` / `ghidraRun`(会打开 GUI 并卡死无界面环境)
+   # 注意:不要直接运行 `ghidra` / `ghidraRun`(会打开 GUI 并卡死无界面环境;
+   # 已部署环境会拒绝非 headless 调用并打印指引)
    # 必须用 analyzeHeadless(常见路径: /usr/share/ghidra/support/analyzeHeadless,
-   # 也可能在 ~/ghidra*/support/ 或 /opt/ghidra/support/)
+   # 也可能在 ~/ghidra*/support/ 或 /opt/ghidra/support/),或 `ghidra --headless`
    export GHIDRA_HB=$(command -v analyzeHeadless || echo /usr/share/ghidra/support/analyzeHeadless)
    mkdir -p /tmp/ghidra_proj
    "$GHIDRA_HB" /tmp/ghidra_proj proj -import ./chal \
