@@ -17,15 +17,16 @@ FMT = r"flag\{[^}]{1,200}\}"
 
 # ── referenced_artifacts ─────────────────────────────────────────────────────
 def test_referenced_artifacts_extracts_ids():
-    txt = "see artifact_deadbeef12 and artifact 0011223344 for details"
+    txt = "see artifact_deadbeef00123456 and artifact 0011223344556677 for details"
     ids = gate.referenced_artifacts(txt)
-    assert "deadbeef12" in ids
-    assert "0011223344" in ids
+    assert "deadbeef00123456" in ids
+    assert "0011223344556677" in ids
 
 
 def test_referenced_artifacts_ignores_short_or_nonhex():
-    # needs 8+ hex chars; 'artifactzz' / short ids must not match
+    # needs exactly 16 hex chars; 'artifactzz' / short ids must not match
     assert gate.referenced_artifacts("artifact_zz no artifact_abc") == []
+    assert gate.referenced_artifacts("artifact_deadbeef12 artifact_deadbeef0012345678") == []
 
 
 # ── format gate ──────────────────────────────────────────────────────────────
@@ -76,14 +77,14 @@ def test_referenced_artifact_without_flag_rejected(tmp_path):
 def test_missing_artifact_id_rejected(tmp_path):
     # output references an id that was never stored → read_text returns None.
     art = ArtifactStore(root=str(tmp_path / "a"))
-    out = "see artifact_deadbeef00"  # never put()
+    out = "see artifact_deadbeef0012345678"  # never put()
     assert gate.flag_ok("flag{nope}", out, flag_format=FMT, artifacts=art) is False
 
 
 def test_none_artifacts_store_only_verbatim(tmp_path):
     # with no store, only verbatim-in-output can pass; artifact path is skipped safely.
     assert gate.flag_ok("flag{ok}", "flag{ok}", flag_format=FMT, artifacts=None) is True
-    assert gate.flag_ok("flag{ok}", "see artifact_deadbeef00", flag_format=FMT, artifacts=None) is False
+    assert gate.flag_ok("flag{ok}", "see artifact_deadbeef0012345678", flag_format=FMT, artifacts=None) is False
 
 
 # ── placeholder rejection (the run-1619 / run-0405 false-positive class) ──────

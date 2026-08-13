@@ -17,8 +17,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-# F27: only canonical 12-hex artifact ids are addressable (see ArtifactStore._find).
-_ARTIFACT_ID = re.compile(r"^[0-9a-f]{12}$")
+# F27: only canonical 16-hex artifact ids are addressable (see ArtifactStore._find).
+_ARTIFACT_ID = re.compile(r"^[0-9a-f]{16}$")
 
 # Round-5: refuse regexes with the classic exponential-backtracking shape —
 # (a) a group containing a quantifier, itself quantified ((a+)+, (\w+\s*)+),
@@ -39,7 +39,7 @@ class ArtifactStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def put(self, content: str | bytes, *, suffix: str = ".txt") -> str:
-        aid = uuid.uuid4().hex[:12]
+        aid = uuid.uuid4().hex[:16]
         path = self.root / f"{aid}{suffix}"
         if isinstance(content, bytes):
             path.write_bytes(content)
@@ -50,7 +50,7 @@ class ArtifactStore:
     def _find(self, artifact_id: str) -> Optional[Path]:
         # F27: artifact_id used to be spliced straight into a glob — a caller
         # (peek is exposed as a model-facing tool) could pass `../../shared_graph.db`
-        # or `*` and read files OUTSIDE the store root. Only canonical 12-hex ids
+        # or `*` and read files OUTSIDE the store root. Only canonical 16-hex ids
         # are addressable now; anything else is "not found".
         if not isinstance(artifact_id, str) or not _ARTIFACT_ID.fullmatch(artifact_id):
             return None

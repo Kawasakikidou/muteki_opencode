@@ -154,7 +154,8 @@ MUTEKI_DEEPSEEK_API_KEY=sk-xxxx
 - **Go ≥ 1.26** —— 仅构建 worker 镜像里的容器内 supervisor 时需要
 - **Docker** —— 仅 `container` worker 后端 / 构建 worker 镜像时需要
 - 你打算用的**引擎 CLI**,需在 `PATH` 上(见下)
-- 当前项目仅在macos上进行过测试，未在windows上进行测试，请酌情处理。
+- 测试基线:macOS 完整通过;Windows 全量回归有 ~70 个环境差异失败(路径/权限/进程
+  语义,均为 Windows 环境特有,非代码缺陷),Linux(WSL)实战路径已验证(见 README.md)。
 
 ### 专有引擎 CLI
 

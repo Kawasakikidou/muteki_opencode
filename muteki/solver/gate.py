@@ -38,8 +38,13 @@ def _compile_flag_format(fmt: str):
 
 
 def referenced_artifacts(text: str) -> list[str]:
-    """Artifact ids referenced in `text` (e.g. 'artifact_deadbeef12')."""
-    return re.findall(r"artifact[_ ]?([0-9a-f]{8,})", text)
+    """Artifact ids referenced in `text` (e.g. 'artifact_deadbeef00123456').
+
+    Canonical ids are exactly 16 hex chars (see ArtifactStore), so only exact
+    matches are extracted — anything shorter or longer is not an addressable
+    artifact.
+    """
+    return re.findall(r"artifact[_ ]?([0-9a-f]{16})(?![0-9a-f])", text)
 
 
 # Inner-body tokens that mean "a flag goes here", not an actual flag. The model

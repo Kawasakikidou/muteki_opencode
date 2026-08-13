@@ -88,6 +88,7 @@ _KNOWN_GOOD = {
     ],
     "opencode": [
         # opencode 官方 installer 装到 ~/.opencode/bin;以下均为常见 PATH 位置
+        "~/.opencode/bin/opencode",
         "~/.local/bin/opencode",
         "/opt/homebrew/bin/opencode",
         "/usr/local/bin/opencode",
