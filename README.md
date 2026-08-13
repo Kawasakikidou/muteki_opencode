@@ -61,7 +61,7 @@ opencode 的 `auth.json`(从宿主 `~/.local/share/opencode/auth.json` 复制),
 ## CLI 总览(本地模式)
 
 所有命令统一用 `uv run` 执行。本地模式(local backend)让 worker 直接在
-本机(WSL)内运行 opencode,不依赖 Docker / worker 镜像,最快上手。
+本机(WSL / Linux / macOS)内运行 opencode,不依赖 Docker / worker 镜像,最快上手。
 需要:`MUTEKI_DEEPSEEK_API_KEY`(coordinator 推理,配在 `.env`)。
 
 ### TUI(推荐:单题交互式解题)
@@ -162,12 +162,53 @@ uv run python -m apps.tui --swarm --desc "完整题目描述,含目标地址" \
 3. **未解的题**:看日志里 worker 卡在哪一步(探路/工具缺失/思路偏差),
    用 `/hint` 引导或调整描述后重跑
 
+## 实战流程(Linux,单题)
+
+Linux 原生环境的本地模式流程,与 WSL 一节等价,只是省去 WSL 引导。容器模式见
+"快速开始"。注:项目官方只在 macOS 实测,Linux 路径代码已支持,首次使用建议先跑
+一道简单题验证引擎认证链路(healthcheck 会先自检)。
+
+### 第 0 步:环境与一次性准备
+
+```bash
+# 1. Python ≥3.13 与 uv
+python3 --version && uv --version
+
+# 2. 装 opencode(官方 installer 支持 Linux,装到 ~/.opencode/bin)
+curl -fsSL https://opencode.ai/install | bash
+~/.opencode/bin/opencode auth login
+
+# 3. 依赖 + 密钥
+uv sync --extra dev
+cp .env.example .env        # 填 MUTEKI_DEEPSEEK_API_KEY=sk-你的key
+
+# 4. (可选)ctf-kb skill 部署到 opencode 全局目录(容器镜像已内置,仅本地模式需要)
+mkdir -p ~/.config/opencode/skills/ctf-rev
+cp skills/ctf-kb/ctf-rev/SKILL.md ~/.config/opencode/skills/ctf-rev/
+```
+
+### 第 1 步:开跑
+
+```bash
+export MUTEKI_OPENCODE_BIN=$HOME/.opencode/bin/opencode   # 钉住 opencode
+uv run python -m apps.tui --swarm --desc "完整题目描述,含目标地址" \
+  --target http://host:port --category web
+```
+
+界面操作与 flag 验证同 WSL 一节的第 3/4 步。与 macOS 的差异:
+- **claude 凭据**:Linux 无 Keychain,`claude setup-token` 写入
+  `~/.claude/.credentials.json`,凭据探测会读该文件。
+- **host.docker.internal**(容器模式):Linux 上不自动解析,代码已自动加
+  `--add-host host.docker.internal:host-gateway`,无需手动配置。
+
 ## 常见问题
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
 | `ModuleNotFoundError` | 未装 dev 依赖 | `uv sync --extra dev` |
 | worker 立即失败/找不到 opencode | which 解析到 Windows npm shim | 装 WSL 原生 opencode 并钉 `MUTEKI_OPENCODE_BIN` |
+| 容器模式 supervisor 连不上 control receiver | Linux 的 `host.docker.internal` 不自动解析 | 代码已自动 `--add-host host.docker.internal:host-gateway`;手动 `docker run` 时保持 bridge 网络 |
+| claude 登录探测不到 | Linux 无 macOS Keychain | 用 `claude setup-token` 写入 `~/.claude/.credentials.json` |
 | `ghidra` 打开 GUI 卡住 | 直接运行了 `ghidra` 命令 | 用 `analyzeHeadless`(ctf-rev skill 已写明,勿直接跑 ghidra) |
 | 网络题连不上靶机 | WSL 网络/代理问题 | 确认 WSL 能 curl 目标地址;`NO_PROXY` 必要时放行内网 |
 | 成本担忧 | worker + coordinator 按 token 计费 | 演示题约几十秒/题;真实题每道几万~几十万 token,先跑 1 道观察 |
