@@ -1838,6 +1838,22 @@ class CliSolver:
         # months (missing `import json` → NameError swallowed → never fired), proving
         # it added no value, while _LAUNDER_RE independently catches the real
         # run-11551 grep-from-disk launder via its path signature. Removed.
+        #
+        # ANTI-LAUNDER LIMIT (accepted tradeoff, do NOT "fix" casually): the defense
+        # above is a BEHAVIOR signature, not a value-level verdict. A worker that
+        # harvests another run's flag and HIDES the tell — e.g.
+        #   f=$(find ~/.codex/sessions -name '*.jsonl' | head -1); grep -o 'FOUND_FLAG=.*' "$f"
+        # so the source path never lands in captured output — emits no launder
+        # signature into raw_output and would pass the gate. Closing that hole
+        # requires cross-run value-dedup, which we deliberately removed (see NOTE
+        # above): most CTF flags are STATIC (same value every run), so value-dedup
+        # false-rejects genuine re-solves (Rivulet) while the old code was also
+        # silently dead for months. The gate's contract is "zero FALSE flags" —
+        # defend against a confused worker echoing a neighbor's flag — NOT "zero
+        # adversarial cheating", which is outside this black-box threat model. A
+        # worker that actively launders + hides its own provenance is an eval-
+        # integrity problem to solve elsewhere, never a reason to weaken/over-tighten
+        # this hardcoded gate.
         text = raw_output or ""
         if self._LAUNDER_RE.search(text):
             return False

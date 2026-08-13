@@ -25,6 +25,7 @@ NOT touch flag/fact/graph/key business logic — that stays in the swarm/gate.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import socket
@@ -353,7 +354,8 @@ class ControlReceiver:
         token = hello.get("token") or ""
         with self._lock:
             expected = self._tokens.get(run_id)
-        ok = expected is not None and token == expected
+        ok = expected is not None and hmac.compare_digest(
+            token.encode(), expected.encode())
         try:
             conn.sendall((json.dumps({"ok": ok, **({} if ok else {"error": "unauthorized"})}) + "\n").encode())
         except OSError:

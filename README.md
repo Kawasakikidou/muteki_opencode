@@ -1,6 +1,14 @@
-# muteki_opencode 
+# muteki_opencode
 
-本文是 `muteki_opencode`(以 muteki 为底座的 CTF agent,接入 opencode 引擎)的部署简介。
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
+
+`muteki_opencode` 是以 [Project Muteki(無敵)](https://github.com/FishCodeTech/muteki)
+为底座的 CTF 求解 agent,接入 **opencode** 引擎作为 worker 执行器。本文是它的部署与使用说明;
+项目架构、架构图、测评与完整文档见 [README_CN.md](README_CN.md)。
+
+Muteki 是**攻击性安全自动化工具** —— 它驱动 CLI agent 执行命令、访问目标服务,**不承诺隔离
+恶意 challenge**。请只在专用、可丢弃的环境(VPS / throwaway VM)里运行,详见
+[SECURITY.md](SECURITY.md)。
 
 ## 快速开始(容器模式)
 
@@ -50,11 +58,46 @@ docker run --rm --entrypoint sh muteki-worker-slim-opencode:latest -c 'which ope
 opencode 的 `auth.json`(从宿主 `~/.local/share/opencode/auth.json` 复制),
 运行时经 XDG_DATA_HOME 投影注入容器。宿主本地模式则直接继承宿主登录。
 
-## 实战测试完整流程(Windows + WSL 本地模式)
+## CLI 总览(本地模式)
 
-从打开 WSL 到解题完毕、用户检查结果的全过程。本地模式(local backend)让
-worker 直接在 WSL 内运行 opencode,不依赖 Docker / worker 镜像,最快上手。
-需要:`MUTEKI_DEEPSEEK_API_KEY`(coordinator 推理)与 WSL2(kali-linux)。
+所有命令统一用 `uv run` 执行。本地模式(local backend)让 worker 直接在
+本机(WSL)内运行 opencode,不依赖 Docker / worker 镜像,最快上手。
+需要:`MUTEKI_DEEPSEEK_API_KEY`(coordinator 推理,配在 `.env`)。
+
+### TUI(推荐:单题交互式解题)
+
+Textual 交互界面:实时事件流(推理/工具调用/flag)+ 状态条(成本/上下文)+
+命令输入(HITL:提示/暂停/提交),适合边跑边看、人工干预。
+
+| 命令 | 说明 |
+|---|---|
+| `uv run python -m apps.tui` | mock 演示模式:脚本化事件流,无需 key,纯看 UI |
+| `uv run python -m apps.tui --swarm --desc "题目描述" --target http://host:port --category web` | 单题实战(无附件题),无需 manifest |
+| `uv run python -m apps.tui --swarm --n-solvers 3` | 指定 swarm 并行 worker 数(默认 2) |
+| `uv run python -m apps.tui --swarm --key <id>` | 按 NYU-bench 题目 key 解题 |
+
+界面操作:
+- 输入框输入命令,Enter 发送,语法 `[target] action text` 或 `/action text`
+- 可用 action:`hint`(给提示)、`pause`(暂停)、`submit`(提交 flag)、`interrupt`(中断)
+- `Esc` 中断当前 run;`Ctrl+C` 退出
+
+### CLI 批量(ctf_runner:一次跑多题/附件题)
+
+```bash
+uv run python -m muteki.batch.ctf_runner manifest.json --report report.md
+```
+
+- `manifest.json`:题目清单(JSON),格式见 `muteki/batch/manifest.example.json`,
+  字段:`engines`(目前填 `["opencode"]`)、`model`(worker 模型)、`timeout`
+  (单题上限秒)、`backend`(`local`/`container`)、`challenges`(数组,每项
+  `id`/`name`/`category`/`description`/`attachments`[附件路径列表])
+- 需要手写 manifest 的场景:**一次跑多道题**或**题目带附件文件**
+  (attachments 字段);远程靶机的单道描述题直接用上面的 TUI 一行命令即可
+- `--report`:战报输出路径(默认 battle_report.md);`--workers`:并行数(当前固定 1)
+
+## 实战流程(Windows + WSL,单题)
+
+从打开 WSL 到解题完毕、用户检查结果的全过程。
 
 ### 第 0 步:启动 WSL 并进入仓库
 
@@ -70,7 +113,7 @@ cd /mnt/<盘符>/<仓库路径>        # 例如 /mnt/e/Repositories/muteki_openc
 # 1. 检查 Python ≥3.13 与 uv(没有 uv 则 pip install uv 或官方安装脚本)
 python3 --version && uv --version
 
-# 2. 安装依赖(注意 --extra dev,否则 ctf_runner 缺包)
+# 2. 安装依赖(注意 --extra dev,否则缺包)
 uv sync --extra dev
 
 # 3. 配置密钥:复制模板并填入 MUTEKI_DEEPSEEK_API_KEY
@@ -90,77 +133,55 @@ mkdir -p ~/.config/opencode/skills/ctf-rev
 cp skills/ctf-kb/ctf-rev/SKILL.md ~/.config/opencode/skills/ctf-rev/
 ```
 
-### 第 2 步:编写 manifest.json(题目清单)
-
-```json
-{
-  "engines": ["opencode"],
-  "model": "opencode-go/deepseek-v4-flash",
-  "timeout": 600,
-  "backend": "local",
-  "challenges": [
-    {
-      "id": "chal-1",
-      "name": "我的第一道题",
-      "category": "web",
-      "description": "完整题目描述,含目标地址,例如:flag 在 http://192.168.x.x:8000/admin 的响应头里",
-      "attachments": []
-    },
-    {
-      "id": "chal-2",
-      "name": "附件题",
-      "category": "rev",
-      "description": "逆向附件,还原 flag 校验逻辑",
-      "attachments": ["attachments/chal2.zip"]
-    }
-  ]
-}
-```
-
-字段说明:
-- `engines`:目前填 `["opencode"]`(worker 引擎)
-- `model`:worker 模型,默认 `opencode-go/deepseek-v4-flash`,可换 `.../deepseek-v4-pro`
-- `timeout`:单题上限(秒),难题建议 600-900
-- `backend`:本地模式填 `local`(容器模式填 `container`)
-- `attachments`:附件相对仓库根的文件路径;远程靶机题留空
-
-### 第 3 步:运行
+### 第 2 步:开跑(无需 manifest)
 
 ```bash
 export MUTEKI_OPENCODE_BIN=$HOME/.opencode/bin/opencode   # 钉住 WSL 原生 opencode
-uv run python -m muteki.batch.ctf_runner manifest.json --report report.md
+uv run python -m apps.tui --swarm --desc "完整题目描述,含目标地址" \
+  --target http://192.168.x.x:8000 --category web
 ```
 
-每道题会输出类似:
-```
-[1/2] 我的第一道题 (web) 开始...
-[1/2] 我的第一道题: ✅ 解出 flag{...} (45s)
-[2/2] 附件题 (rev) 开始...
-```
+类别取值:web / crypto / reverse / forensics / misc / pwn。
+带附件的题目见"CLI 批量"一节(manifest 的 `attachments` 字段)。
+
+### 第 3 步:TUI 界面与干预
+
+- 上方状态条显示 lineup、累计成本、上下文用量
+- 主区实时滚动 worker 事件:推理、工具调用、事实、flag
+- 输入框可随时发 HITL 命令(见 CLI 总览),如 `/hint 试试XX方向`
 
 ### 第 4 步:用户检查结果
 
-1. **看战报** `report.md`:每题 解出/未解、flag、用时
+1. **界面直接显示 flag**(`⚑ FLAG flag{...}` 行),复制到比赛平台提交即可
 2. **验证 flag 真实性**:flag 只有出现在 worker 真实执行输出中才会被接受
-   (provenance gate),把报告中的 flag 粘贴到比赛平台提交即可确认;
-   想人工复核可查运行日志:
+   (provenance gate);想人工复核可查运行日志:
    ```bash
-   rg -l "flag\{" sessions/ | tail -3        # 找到该 run 的日志
-   rg "flag\{" <日志路径>                      # flag 出现在 worker 真实输出里
+   rg -l "flag\{" work/sessions/ | tail -3     # 找到该 run 的日志
+   rg "flag\{" <日志路径>                       # flag 出现在 worker 真实输出里
    ```
-3. **未解的题**:到 `sessions/` 对应 run 的日志里看 worker 卡在哪一步
-   (探路/工具缺失/思路偏差),调整描述或 `timeout` 后重跑
+3. **未解的题**:看日志里 worker 卡在哪一步(探路/工具缺失/思路偏差),
+   用 `/hint` 引导或调整描述后重跑
 
-### 常见问题
+## 常见问题
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
 | `ModuleNotFoundError` | 未装 dev 依赖 | `uv sync --extra dev` |
 | worker 立即失败/找不到 opencode | which 解析到 Windows npm shim | 装 WSL 原生 opencode 并钉 `MUTEKI_OPENCODE_BIN` |
-| 演示题报文件不存在 | 示例 manifest 的 `/tmp/...` 演示文件需自行创建 | 换真实题目,或先 `echo 'flag{...}' > /tmp/batch_demo_flag.txt` |
+| `ghidra` 打开 GUI 卡住 | 直接运行了 `ghidra` 命令 | 用 `analyzeHeadless`(ctf-rev skill 已写明,勿直接跑 ghidra) |
 | 网络题连不上靶机 | WSL 网络/代理问题 | 确认 WSL 能 curl 目标地址;`NO_PROXY` 必要时放行内网 |
-| 单题耗时长 | `timeout` 太小或题难 | 调大 `timeout`,难题给 600-900s |
 | 成本担忧 | worker + coordinator 按 token 计费 | 演示题约几十秒/题;真实题每道几万~几十万 token,先跑 1 道观察 |
 
-> 备注:`.env` 含真实密钥且已被 `.gitignore` 忽略,切勿提交;`report.md`、
-> `sessions/`、`artifacts/` 均为运行产物,不入库。
+> 备注:`.env` 含真实密钥且已被 `.gitignore` 忽略,切勿提交;`work/`、
+> `sessions/`、`artifacts/`、`attachments/` 均为运行产物,不入库。
+
+## 许可证与第三方组件
+
+- **本仓库**(muteki_opencode)以 [GNU AGPL-3.0](LICENSE) 许可发布。
+- 依赖的**引擎 CLI 各有其自身许可**,且会向各自厂商回传数据:
+  - `opencode` —— MIT License,© 2025 opencode,经 `npm install -g opencode-ai` 引入;
+  - `claude` / `codex` / `cursor` —— 专有闭源,须自备订阅与认证。
+- `skills/ctf-kb/` 下的 CTF 知识技能源自 [VulnClaw](https://github.com/Netw0rkNoob/VulnClaw)
+  (MIT License,© 2026 UncleC),已做工具名通用化。
+- 完整的三方版权声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与
+  [skills/ctf-kb/NOTICE.md](skills/ctf-kb/NOTICE.md)。

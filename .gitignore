@@ -78,6 +78,9 @@ progress.md
 feature_list.json
 session-handoff.md
 
+# Reasonix local tool config (machine-specific paths, not part of the distribution)
+reasonix.toml
+
 # Local-only working notes 鈥?kept on disk for reference, NOT part of the
 # distribution (working notes, not user-facing documentation).
 docs/_local/
